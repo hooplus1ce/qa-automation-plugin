@@ -1850,17 +1850,25 @@ async def _check_wait_condition(
         matched = joined == expected_text if exact else expected_text in joined
         return {"met": matched, "detail": {"count": count, "text": joined[:200]}}
 
-    # text_present: 目标 frame (若指定 iframe) 或全部 frame 的 body 文本
+    # text_present: 目标 frame (若指定 iframe) 或全部 frame 的 DOM 文本。
+    # 用 textContent 而非 innerText: innerText 只返回"渲染可见"文本, 对
+    # display:none / 动画中 (ant-message move-up-leave 类) 的元素读不到,
+    # 短命校验消息 (3s) 极易错过; textContent 返回全部 DOM 文本 (含隐藏态),
+    # 语义为"文本已挂载即出现", 且无 reflow 开销 (大页面快一个量级)。
     frames: List[Any] = []
     if iframe_selector:
         frame = await _locator_content_frame(target)
         if frame is not None:
             frames = [frame]
     else:
-        frames = page.frames
+        # 主 frame 优先: 消息/校验提示通常在顶层或最近交互 frame,
+        # 避免每次轮询从第一个 frame 开始扫而拖慢命中
+        frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
     for f in frames:
         try:
-            body_text = await f.evaluate("() => document.body ? document.body.innerText : ''")
+            body_text = await f.evaluate(
+                "() => document.body ? (document.body.textContent || '') : ''"
+            )
         except Exception:
             continue
         if body_text and expected_text in body_text:

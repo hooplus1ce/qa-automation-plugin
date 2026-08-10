@@ -99,11 +99,10 @@ skills_dir = Path(__file__).resolve().parents[2] / "skills"
 mcp = FastMCP(
     "QA Automated Orchestrator",
     instructions=(
-        "企业级 Web 系统 (SCM/MOM/WMS/ERP) 自动化测试 MCP 服务: 通过 Playwright CDP "
-        "接管本地 Chrome (需以 --remote-debugging-port=9222 启动), 提供页面元素分析、"
-        "点击/输入/动作链执行、动态层探查、VTable 场景图交互、用例录制与 Shadcn "
-        "风格 Excel 资产导出。所有工具共享同一浏览器页面并已串行化; 录制类工具 "
-        "需先调用 start_recording 开启会话, 结束用 export_session 一键落盘。"
+        "企业级 Web 系统（SCM/MOM/WMS/ERP）自动化测试 MCP 服务：通过 CDP 接管本地 "
+        "Chrome（需 --remote-debugging-port=9222 启动），支持 iframe 链式穿透；提供元素分析、"
+        "点击/输入/动作链、动态层探查、VTable 场景图交互；用例录制先调 start_recording "
+        "开启会话，结束用 export_session 一键落盘至用户项目；所有工具共享同一页面并已串行化。"
     ),
     version="0.2.0",
     middleware=[ToolLoggingMiddleware(), ToolSerializationMiddleware()],

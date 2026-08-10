@@ -214,3 +214,92 @@ class TestLayerAwareDiagnosis(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWaitForCondition(unittest.IsolatedAsyncioTestCase):
+    """wait_for_condition 条件检查 (text_present 用 textContent 含隐藏文本)。"""
+
+    class _Frame:
+        def __init__(self, url, text):
+            self.url = url
+            self._text = text
+
+        async def evaluate(self, script):
+            return self._text
+
+    async def _check(self, page, condition, selector=None, expected=None, exact=False):
+        from unittest.mock import AsyncMock, patch
+
+        from qa_mcp.tools import browser
+
+        with patch.object(
+            browser, "_resolve_frame_target", new=AsyncMock(return_value=(None, []))
+        ):
+            return await browser._check_wait_condition(
+                page, condition, selector, None, expected, exact
+            )
+
+    async def test_text_present_matches_sub_frame(self):
+        """消息在校验 iframe 底部 DOM: textContent 匹配 (含隐藏/动画文本)。"""
+        from unittest.mock import AsyncMock
+
+        main = self._Frame("https://x/", "采购订单页面")
+        sub = self._Frame("https://x/app", "表单内容 请选择采购订单! 结束")
+        page = AsyncMock()
+        page.main_frame = main
+        page.frames = [main, sub]
+        r = await self._check(page, "text_present", expected="请选择采购订单")
+        self.assertTrue(r["met"])
+
+    async def test_text_present_matches_hidden_message(self):
+        """ant-message 消息 (move-up-leave 动画类/隐藏态): innerText 读不到,
+        textContent 仍可匹配 —— 短命校验消息不再错过。"""
+        from unittest.mock import AsyncMock
+
+        main = self._Frame("https://x/", "")
+        msg_frame = self._Frame(
+            "https://x/app",
+            "请选择采购订单! 请选择采购订单!",
+        )
+        page = AsyncMock()
+        page.main_frame = main
+        page.frames = [main, msg_frame]
+        r = await self._check(page, "text_present", expected="请选择采购订单")
+        self.assertTrue(r["met"])
+
+    async def test_text_present_not_found(self):
+        from unittest.mock import AsyncMock
+
+        main = self._Frame("https://x/", "无目标文本")
+        page = AsyncMock()
+        page.main_frame = main
+        page.frames = [main]
+        r = await self._check(page, "text_present", expected="不存在的内容")
+        self.assertFalse(r["met"])
+        self.assertEqual(r["detail"]["frames_checked"], 1)
+
+    async def test_element_visible_with_count(self):
+        from unittest.mock import AsyncMock
+
+        main = self._Frame("https://x/", "")
+        page = AsyncMock()
+        page.main_frame = main
+        page.frames = [main]
+        # element_visible 需要 locator: 走 _resolve_frame_target mock 返回 fake target
+        from unittest.mock import AsyncMock as AM, MagicMock, patch
+
+        lc = AM()
+        lc.count = AM(return_value=1)
+        lc.first = AM()
+        lc.first.is_visible = AM(return_value=True)
+        target = MagicMock()  # locator 为同步调用, 不能用 AsyncMock (返回 coroutine)
+        target.locator.return_value = lc
+        from qa_mcp.tools import browser
+
+        with patch.object(
+            browser, "_resolve_frame_target", new=AM(return_value=(target, []))
+        ):
+            r = await browser._check_wait_condition(
+                page, "element_visible", "#ok", None, None, False
+            )
+        self.assertTrue(r["met"])

@@ -249,14 +249,9 @@ class ConfigFormApp(FastMCPApp):
 
         @self.tool(model=True)
         def submit_config(data: dict[str, Any] | None = None) -> str:
-            """校验并保存插件配置 (表单 UI 提交或模型直接调用)。
-
-            当宿主未渲染 setup_form 表单 UI 时, 模型可先向用户展示当前配置
-            (从 ~/.qa-automation-plugin/.env 或表单默认值) 并确认需要修改的
-            字段, 然后传完整 data (6 个字段: project_dir / cdp_url /
-            vision_provider / vision_model / download_dir / visual_effects)
-            直接调用本工具完成配置写入。
-            """
+            """校验并保存插件配置。UI 表单未渲染时, 展示当前配置并确认字段后,
+            传完整 data (project_dir/cdp_url/vision_provider/vision_model/
+            download_dir/visual_effects) 直接提交。"""
             from qa_mcp.tools.setup import PluginConfigForm, handle_config_form
 
             if data is None:
@@ -269,13 +264,11 @@ class ConfigFormApp(FastMCPApp):
         @self.ui(
             name="setup_form",
             description=(
-                "插件环境变量配置表单（Claude Desktop Apps UI）：表单预填当前"
-                "生效配置（用户项目根目录 / Chrome CDP 地址 / 视觉识别通道 / "
-                "视觉模型 / 下载目录 / 鼠标点击高亮），填写并提交后校验并写入"
-                "用户级配置 ~/.qa-automation-plugin/.env，重启客户端生效。"
-                "若宿主未渲染表单 UI（无可见输入控件），不要等待用户填写——"
-                "改为向用户展示当前配置并确认需修改的字段，然后调用 "
-                "submit_config 直接提交完整配置。Claude Code 请用 plugin_setup。"
+                "插件环境变量配置表单（Claude Desktop Apps UI）：预填当前生效"
+                "配置（项目根目录/CDP 地址/视觉通道/视觉模型/下载目录/鼠标高亮），"
+                "提交后写入 ~/.qa-automation-plugin/.env，重启生效。UI 未渲染时"
+                "展示配置并确认字段后调 submit_config 提交。Claude Code 用 "
+                "plugin_setup。"
             ),
         )
         def setup_form() -> PrefabApp:
