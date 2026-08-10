@@ -5,6 +5,8 @@ from collections.abc import Sequence
 from fastmcp.server.providers import Provider
 from fastmcp.tools import Tool
 
+from qa_mcp.config import INTERACTIVE_UI_ENABLED
+
 
 class VTableAutomationProvider(Provider):
     """VTable (canvas 渲染表格) 工具集: 实例刷新 / 列头分析 / 单元格读取 / 滚动 / 勾选 / 拖拽。"""
@@ -20,6 +22,7 @@ class VTableAutomationProvider(Provider):
             vtable_get_cell_text_impl,
             vtable_get_column_values_impl,
             vtable_get_row_count_impl,
+            vtable_records_view_impl,
             vtable_refresh_instance_impl,
             vtable_resize_column_impl,
             vtable_scan_columns_impl,
@@ -52,6 +55,23 @@ class VTableAutomationProvider(Provider):
                 vtable_get_all_records_impl,
                 name="vtable_get_all_records",
                 description="一次性无损读取表格中所有的完整后台行记录对象 (JSON)。可用于整表断言和宏观数据检查，无需操作 DOM。",
+            ),
+            *(
+                [
+                    Tool.from_function(
+                        vtable_records_view_impl,
+                        name="vtable_records_view",
+                        meta={
+                            "ui": __import__(
+                                "fastmcp.apps.config",
+                                fromlist=["app_config_to_meta_dict"],
+                            ).app_config_to_meta_dict(True)
+                        },
+                        description="VTable 全量数据可视化 (Claude Desktop Apps UI): 渲染可搜索/排序的 DataTable 供直接浏览。Claude Code (TUI) 不渲染 Apps UI, 降级使用 vtable_get_all_records (JSON)。max_rows 限制渲染行数 (默认 1000)。",
+                    )
+                ]
+                if INTERACTIVE_UI_ENABLED
+                else []
             ),
             Tool.from_function(
                 vtable_get_cell_text_impl,

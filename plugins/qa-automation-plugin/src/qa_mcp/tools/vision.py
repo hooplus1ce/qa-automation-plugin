@@ -622,41 +622,6 @@ async def _describe_image_antigravity(
 _EFFORT_BY_GRANULARITY = {"quick": "low", "standard": "medium", "deep": "high"}
 
 
-async def _ask_effort_interactive(ctx) -> Optional[str]:
-    """交互式选择识别粒度 (MCP elicitation 单选弹窗)。
-
-    返回 reasoning_effort 覆盖值; 用户拒绝/取消/客户端不支持 (elicitation
-    不可用) 时返回 None, 由调用方保持 auto 降级——不阻塞识别流程。
-    """
-    from fastmcp.server.elicitation import AcceptedElicitation
-
-    try:
-        result = await ctx.elicit(
-            "请选择图片识别粒度（影响识别质量与配额消耗）",
-            {
-                "quick": {
-                    "title": "快速",
-                    "description": "低思考深度：适合 OCR、颜色、按钮状态等简单判断",
-                },
-                "standard": {
-                    "title": "标准",
-                    "description": "中等思考深度：默认选项",
-                },
-                "deep": {
-                    "title": "深度",
-                    "description": "高思考深度：适合复杂场景、表格数据理解",
-                },
-            },
-            response_title="识别粒度",
-        )
-    except Exception as e:  # noqa: BLE001 — 非交互客户端降级
-        logger.warning(f"elicitation 不可用, 识别粒度降级 auto: {e}")
-        return None
-    if isinstance(result, AcceptedElicitation) and isinstance(result.data, str):
-        return _EFFORT_BY_GRANULARITY.get(result.data)
-    return None  # declined / cancelled → 保持 auto
-
-
 async def vision_login_impl() -> dict:
     """Antigravity 视觉通道 OAuth 授权登录 (MCP 工具)。
 
@@ -703,9 +668,21 @@ async def describe_image_impl(
     不重复调用 API。
     """
     if interactive and ctx is not None:
-        override = await _ask_effort_interactive(ctx)
-        if override:
-            reasoning_effort = override
+        from qa_mcp.tools.interact import elicit_with_timeout
+
+        override = await elicit_with_timeout(
+            ctx,
+            "请选择图片识别粒度 (超时默认标准):",
+            {
+                "quick": {"title": "快速", "description": "低思考深度：适合 OCR、颜色、按钮状态等简单判断"},
+                "standard": {"title": "标准", "description": "中等思考深度：默认选项"},
+                "deep": {"title": "深度", "description": "高思考深度：适合复杂场景、表格数据理解"},
+            },
+            default="standard",
+            response_title="识别粒度",
+        )
+        if override in _EFFORT_BY_GRANULARITY:
+            reasoning_effort = _EFFORT_BY_GRANULARITY[override]
 
     try:
         provider = _select_provider()

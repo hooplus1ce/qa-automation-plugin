@@ -167,6 +167,19 @@ TOOL_MAX_EXECUTION_MS = _env_int("TOOL_MAX_EXECUTION_MS", 300000)
 ACTION_STEP_TIMEOUT_MS = _env_int("ACTION_STEP_TIMEOUT_MS", 15000)
 # 点击/输入后的统一观察轮询窗口 (动态层/消息捕获)
 OBSERVE_WAIT_MS = _env_int("OBSERVE_WAIT_MS", 1200)
+# 交互式 UI (elicitation 弹窗/Apps 卡片) 等待用户操作的超时秒数;
+# 超时未操作默认按"直接进入下一步"处理 (危险确认类可在工具层配置)
+INTERACT_TIMEOUT_S = _env_int("INTERACT_TIMEOUT_S", 10)
+# 交互式 UI 工具总开关: false (默认) 时不注册 setup_form/choose/request_approval/
+# vtable_records_view/plugin_setup 等 UI 工具 (描述不进入上下文, 省 token),
+# 且所有 elicitation 交互点直接走默认值 (不弹窗)。需要交互式表单/卡片时
+# 在 .env 设置 INTERACTIVE_UI_ENABLED=true 并重启客户端。
+INTERACTIVE_UI_ENABLED = os.getenv("INTERACTIVE_UI_ENABLED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 # Ant Design 下拉: 首次等待新下拉挂载; 后续每轮重试等待; 重试总轮数; 重试间隔
 # (首等 3s 覆盖下拉动画; 轮询 6 次 × 200ms 快速兜底, 不长时间干等)
 SELECT_WAIT_FIRST_MS = _env_int("SELECT_WAIT_FIRST_MS", 3000)

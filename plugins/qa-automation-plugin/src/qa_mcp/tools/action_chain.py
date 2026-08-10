@@ -1,5 +1,7 @@
 import asyncio
 import logging
+
+from fastmcp import Context
 from typing import Any, Dict, List, Optional
 
 from qa_mcp.config import ACTION_STEP_TIMEOUT_MS, ELEMENT_WAIT_TIMEOUT_MS
@@ -240,8 +242,15 @@ async def execute_action_chain_impl(
     stop_on_error: bool = True,
     visualize: Optional[bool] = None,
     detail: str = "brief",
+    confirm: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """批量动作链: 一次调用顺序执行多个动作, 全部完成后统一观察一次。
+
+    confirm=True 时先弹出交互确认 (elicitation), 用户批准才执行;
+    超时未操作默认继续执行 (INTERACT_TIMEOUT_S, 可配置)。
+    Desktop 端模型也可改用 request_approval 卡片确认。
+    若用户拒绝: 返回 cancelled, 不执行任何动作。
 
     actions 每项支持:
       click:         {action, by(css/xpath/role/coordinate), selector, iframe_selector, x, y, role, name, click_type, description}
@@ -263,6 +272,31 @@ async def execute_action_chain_impl(
         raise ValueError("actions 不能为空")
     if detail not in ("brief", "full"):
         raise ValueError(f"detail 仅支持 brief / full, 收到: {detail}")
+
+    # 执行前交互确认 (confirm=True): 展示动作摘要, 用户批准才执行;
+    # 超时未操作默认继续 (安全提示: 批量动作可能包含不可逆操作)
+    if confirm:
+        from qa_mcp.tools.interact import elicit_with_timeout
+
+        summary = "\n".join(
+            f"{i + 1}. {a.get('description') or a.get('action')} "
+            f"({a.get('selector') or a.get('by') or ''})"
+            for i, a in enumerate(actions[:10])
+        )
+        if len(actions) > 10:
+            summary += f"\n... 共 {len(actions)} 步"
+        decision = await elicit_with_timeout(
+            ctx,
+            f"即将执行动作链 ({len(actions)} 步), 是否继续?\n{summary}",
+            {"proceed": {"title": "继续执行"}, "abort": {"title": "取消"}},
+            default="proceed",  # 超时未操作默认继续
+            response_title="动作链确认",
+        )
+        if decision != "proceed":
+            return {
+                "status": "cancelled",
+                "message": "用户取消了动作链执行, 未执行任何动作。",
+            }
 
     page = await browser_mgr.get_page()
     # 链首统一导航快照 (URL + iframe 清单 + 弹层指纹)

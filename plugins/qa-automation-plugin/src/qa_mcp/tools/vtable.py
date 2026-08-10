@@ -1232,6 +1232,32 @@ async def vtable_get_row_count_impl(iframe_selector: str = "div[aria-hidden=fals
 async def vtable_get_all_records_impl(iframe_selector: str = "div[aria-hidden=false] iframe") -> List[Dict[str, Any]]:
     return await vtable_mgr.get_all_records(iframe_selector)
 
+
+async def vtable_records_view_impl(
+    iframe_selector: str = "div[aria-hidden=false] iframe", max_rows: int = 1000
+):
+    """VTable 全量数据可视化 (Claude Desktop Apps UI): 返回可搜索/排序的 DataTable。
+
+    Claude Code (TUI) 不渲染 Apps UI, 降级使用 vtable_get_all_records (JSON)。
+    """
+    from prefab_ui.app import PrefabApp
+    from prefab_ui.components import Column, DataTable, DataTableColumn, Heading, Text
+
+    records = await vtable_mgr.get_all_records(iframe_selector)
+    if not records:
+        return PrefabApp(state={}, view=Column(gap=2, children=[Text("表格为空")]))
+    if max_rows and len(records) > max_rows:
+        records = records[:max_rows]
+    keys = list(records[0].keys())
+    columns = [
+        DataTableColumn(key=k, header=k, sortable=True) for k in keys[:20]
+    ]
+    with PrefabApp(state={}) as app:
+        with Column(gap=3, css_class="p-4"):
+            Heading(f"VTable 数据 ({len(records)} 行)")
+            DataTable(columns=columns, rows=records, search=True)
+    return app
+
 async def vtable_get_cell_text_impl(row_index: int, col_field: str, iframe_selector: str = "div[aria-hidden=false] iframe", visual: bool = True) -> Any:
     return await vtable_mgr.get_cell_text(row_index, col_field, iframe_selector, visual)
 

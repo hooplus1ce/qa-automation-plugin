@@ -31,8 +31,42 @@ class RecordingSession(BaseModel):
     steps: List[FlowStep] = []
 
 async def start_recording_impl(
-    flow_name: str, system_under_test: str, description: str, ctx: Context
+    flow_name: str,
+    system_under_test: str,
+    description: str,
+    ctx: Context,
+    interactive: bool = False,
 ) -> str:
+    """开启录制会话。
+
+    interactive=True 时先弹出交互表单收集录制参数 (未提供值的字段),
+    超时未操作默认使用当前传入值继续。
+    """
+    if interactive:
+        from pydantic import BaseModel, Field
+
+        from qa_mcp.tools.interact import elicit_with_timeout
+
+        class RecordingForm(BaseModel):
+            flow_name: str = Field(..., title="场景名称", description="如 基础配置_新增字典项")
+            system_under_test: str = Field(
+                ..., title="被测系统", description="如 WMS"
+            )
+            description: str = Field(..., title="场景描述", description="本次录制内容说明")
+
+        collected = await elicit_with_timeout(
+            ctx,
+            "请确认录制会话参数 (超时默认使用当前传入值):",
+            RecordingForm,
+            default=None,
+        )
+        if collected:
+            flow_name = str(collected.get("flow_name") or flow_name)
+            system_under_test = str(
+                collected.get("system_under_test") or system_under_test
+            )
+            description = str(collected.get("description") or description)
+
     await ctx.set_state(
         SESSION_KEY,
         RecordingSession(

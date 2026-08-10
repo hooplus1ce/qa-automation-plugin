@@ -134,6 +134,52 @@ class ActionChainTests(unittest.IsolatedAsyncioTestCase):
         snap.assert_awaited_once()
         observe.assert_awaited_once()
 
+    async def test_confirm_approved_executes(self):
+        """confirm=True + 用户批准 → 放行到执行阶段。"""
+        page = FakePage()
+        bm, snap, observe = make_mocks(page)
+        actions = [{"action": "click", "by": "css", "selector": "#ok", "description": "确定"}]
+        with patch("qa_mcp.tools.action_chain.browser_mgr", bm), \
+             patch("qa_mcp.tools.action_chain.snapshot_navigation", snap), \
+             patch("qa_mcp.tools.action_chain.observe_after_click", observe), \
+             patch("qa_mcp.tools.action_chain._do_click", new=AsyncMock()) as do_click, \
+             patch("qa_mcp.tools.interact.elicit_with_timeout", new=AsyncMock(return_value="proceed")) as elicit:
+            result = await execute_action_chain_impl(actions, confirm=True, ctx=object())
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["executed"], 1)
+        elicit.assert_awaited_once()
+        do_click.assert_awaited_once()
+
+    async def test_confirm_rejected_cancels(self):
+        """confirm=True + 用户拒绝 → cancelled, 不执行任何动作。"""
+        page = FakePage()
+        bm, snap, observe = make_mocks(page)
+        actions = [{"action": "click", "by": "css", "selector": "#ok", "description": "确定"}]
+        with patch("qa_mcp.tools.action_chain.browser_mgr", bm), \
+             patch("qa_mcp.tools.action_chain.snapshot_navigation", snap), \
+             patch("qa_mcp.tools.action_chain.observe_after_click", observe), \
+             patch("qa_mcp.tools.action_chain._do_click", new=AsyncMock()) as do_click, \
+             patch("qa_mcp.tools.interact.elicit_with_timeout", new=AsyncMock(return_value="abort")) as elicit:
+            result = await execute_action_chain_impl(actions, confirm=True, ctx=object())
+        self.assertEqual(result["status"], "cancelled")
+        elicit.assert_awaited_once()
+        do_click.assert_not_awaited()  # 拒绝后未执行任何动作
+
+    async def test_confirm_timeout_defaults_proceed(self):
+        """confirm=True + 超时未操作 → 默认继续执行 (proceed)。"""
+        page = FakePage()
+        bm, snap, observe = make_mocks(page)
+        actions = [{"action": "click", "by": "css", "selector": "#ok", "description": "确定"}]
+        with patch("qa_mcp.tools.action_chain.browser_mgr", bm), \
+             patch("qa_mcp.tools.action_chain.snapshot_navigation", snap), \
+             patch("qa_mcp.tools.action_chain.observe_after_click", observe), \
+             patch("qa_mcp.tools.action_chain._do_click", new=AsyncMock()) as do_click, \
+             patch("qa_mcp.tools.interact.elicit_with_timeout", new=AsyncMock(return_value="proceed")):
+            result = await execute_action_chain_impl(actions, confirm=True, ctx=object())
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["executed"], 1)
+        do_click.assert_awaited_once()
+
     async def test_stop_on_error_false_collects_failures(self):
         page = FakePage()
         bm, snap, observe = make_mocks(page)

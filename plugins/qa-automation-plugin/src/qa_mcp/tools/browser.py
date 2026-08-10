@@ -6,6 +6,8 @@ import os
 import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+from fastmcp import Context
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 from qa_mcp.config import (
     CDP_URL,
@@ -132,6 +134,24 @@ class BrowserManager:
         self._target_page = matches[0]
         logger.info(f"切换目标标签页: {self._target_page.url}")
         return self._target_page
+
+    async def list_pages(self) -> List[dict]:
+        """列出当前浏览器上下文的所有标签页 (url/title), 供交互式选页。"""
+        async with self._lock:
+            if not self._playwright:
+                self._playwright = await async_playwright().start()
+            if not self._browser:
+                await self._connect()
+        result: List[dict] = []
+        pages = list(self._context.pages) if self._context else []
+        for p in pages:
+            if p.is_closed():
+                continue
+            try:
+                result.append({"url": p.url, "title": await p.title()})
+            except Exception:
+                continue
+        return result
 
     async def get_page(self) -> Page:
         async with self._lock:
@@ -1555,14 +1575,37 @@ async def click_interact_impl(
 
 # ==================== 目标标签页切换工具 ====================
 
-async def switch_target_page_impl(url_pattern: str) -> dict:
+async def switch_target_page_impl(
+    url_pattern: str = "",
+    interactive: bool = False,
+    ctx: Context = None,
+) -> dict:
     """显式切换/重绑 MCP 操作目标标签页 (按 URL 子串匹配) 并锁定。
 
-    默认目标页锁定机制: 首次工具调用自动选择并锁定一个标签页, 后续操作固定
-    作用于该页, 不受用户新开/切换标签页影响。当需要把自动化切到另一个页面
-    (如同时维护多系统测试) 时, 用本工具重绑。
+    interactive=True 且未指定 url_pattern 时, 弹出交互选择让用户挑选目标页
+    (候选页列表单选); 超时未操作默认选择第一个候选页继续。
     """
     await browser_mgr.get_page()  # 确保 CDP 连接就绪
+
+    if interactive and not url_pattern:
+        from qa_mcp.tools.interact import elicit_with_timeout
+
+        candidates = await browser_mgr.list_pages()
+        if not candidates:
+            return {"status": "error", "message": "未发现可切换的标签页"}
+        options = {}
+        for i, info in enumerate(candidates[:8]):
+            label = info.get("title") or info.get("url") or f"页面 {i + 1}"
+            options[str(i)] = {"title": label[:60], "description": info.get("url", "")[:80]}
+        picked = await elicit_with_timeout(
+            ctx,
+            "请选择要操作的标签页 (超时默认第一个):",
+            options,
+            default="0",
+            response_title="选择目标页",
+        )
+        url_pattern = candidates[int(picked)]["url"]
+
     try:
         await browser_mgr.switch_target(url_pattern)
     except RuntimeError as e:

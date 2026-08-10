@@ -275,12 +275,45 @@
   （项目根目录/CDP 地址/视觉通道/视觉模型/下载目录/鼠标高亮，预填当前生效值），
   校验后写入用户级 `~/.qa-automation-plugin/.env`，**重启客户端生效**。用户要求
   配置或工具报配置缺失时由主模型调用；取消/客户端不支持时零修改。
-  **Claude Desktop 另有 Apps 表单**（`setup_form`，FastMCP FormInput）：同一
+  **Claude Desktop 另有 Apps 表单**（`setup_form`，定制版 ConfigFormApp）：同一
   Pydantic 模型渲染为原生表单 UI，提交回调写入同一 .env——Claude Code (TUI)
-  自动降级走 elicitation 表单，Desktop 走原生 UI。
+  自动降级走 elicitation 表单，Desktop 走原生 UI（注意：Claude Desktop 不支持
+  elicitation 多字段表单，配置请用 `setup_form`；`plugin_setup` 报"不支持表单"
+  时应切换）。
 - `choose`: **Desktop 选择卡片**（FastMCP Apps Choice provider）——可点击选项
   按钮替代文本回复，选择结果作为消息回对话。Claude Code (TUI) 不渲染 Apps UI，
   降级用 `describe_image(interactive=True)` 的 elicitation 单选。
+- `request_approval`: **Desktop 审批卡片**（FastMCP Apps Approval provider）——
+  危险操作执行前展示摘要与继续/取消按钮。Claude Code 降级用
+  `execute_action_chain(confirm=True)` 的 elicitation 确认。
+- `vtable_records_view`: **VTable 数据可视化**（Apps DataTable，可搜索/排序）——
+  Claude Code 降级用 `vtable_get_all_records` (JSON)。
+
+### 交互式 UI 超时策略（10 秒默认）
+所有交互点（识别粒度/动作链确认/选页/录制参数）等待用户操作默认 **10 秒**
+（`INTERACT_TIMEOUT_S` 可配置）；超时未操作**默认选择直接进入下一步**
+（如动作链确认超时默认继续执行、粒度超时默认标准）——交互永不阻塞流程；
+用户显式拒绝/取消则按拒绝处理。
+
+**Claude Desktop 模式差异（实测）**：Apps UI（配置表单 `setup_form`、选择卡片
+`choose`、审批卡片 `request_approval`、VTable DataTable）仅在 **cowork 模式**
+渲染；**code 模式不渲染** Apps UI——此时模型自动降级为「展示当前配置 → 向用户
+确认字段 → 直接调用 `submit_config` 提交」完成同样配置（`plugin_setup` 的
+elicitation 多字段表单在 Desktop 不受支持，会报"不支持表单"并引导切换）。
+
+**交互 UI 总开关 `INTERACTIVE_UI_ENABLED`**（默认 `false`）：关闭时不注册
+`setup_form`/`choose`/`request_approval`/`plugin_setup`/`vtable_records_view`
+等长描述工具（**描述不进入上下文，节省 token**），且所有 elicitation 交互点
+直接走默认值（不弹窗、不阻塞）。需要交互式表单/卡片时在用户级
+`~/.qa-automation-plugin/.env` 设 `INTERACTIVE_UI_ENABLED=true` 并重启客户端。
+
+双轨实现：
+- **Claude Code / Desktop（elicitation）**：`asyncio.wait_for` 超时 → 默认值继续
+- **Desktop Apps 卡片**（`choose` / `request_approval` 定制版）：Prefab
+  `SetInterval(count=1, while_=未操作, onComplete=超时默认消息)` 挂于卡片
+  `on_mount`——10 秒倒计时（卡片显示文案），用户点击选项后定时器立即停止
+  （用户操作优先），超时未操作自动回传默认选择消息驱动模型继续。
+- 工具参数 `timeout_s` / `default_option` / `default_action` 可按次覆盖。
 - `start_recording`: 初始化测试用例录制会话。
 - `execute_and_record`: 执行动作并自动记录最优高韧性语义定位步骤。
 

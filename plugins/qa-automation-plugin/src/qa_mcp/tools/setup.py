@@ -17,33 +17,40 @@ from qa_mcp.config import CDP_URL, PROJECT_DIR, VISUAL_EFFECTS, user_env_path
 
 
 class PluginConfigForm(BaseModel):
-    """交互式配置表单 (字段 title/description 渲染为表单标签与说明)。"""
+    """交互式配置表单 (字段 title/description 渲染为表单标签与说明)。
+
+    默认值在模块导入时求值 (与 config 加载的 .env 同步), 重启客户端后自动
+    反映最新配置; elicitation 只接受 BaseModel 类 (实例会触发 unhashable)。
+    """
 
     project_dir: str = Field(
-        ...,
+        default=PROJECT_DIR,
         title="用户项目根目录",
         description="截图/证据/下载等资产落盘的项目绝对路径 (如 D:\\MyProject)",
     )
     cdp_url: str = Field(
-        default="http://127.0.0.1:9222",
+        default=CDP_URL,
         title="Chrome CDP 地址",
         description="Chrome 远程调试端口 (需以 --remote-debugging-port=9222 启动)",
     )
     vision_provider: Literal["auto", "antigravity", "tokenhub", "custom"] = Field(
-        default="auto",
+        default=os.getenv("VISION_PROVIDER", "auto").strip() or "auto",
         title="视觉识别通道",
         description="auto: 已登录 Antigravity 走 antigravity, 否则 tokenhub",
     )
     vision_model: str = Field(
-        default="gemini-3.6-flash",
+        default=os.getenv("VISION_MODEL", "gemini-3.6-flash").strip()
+        or "gemini-3.6-flash",
         title="视觉模型名",
         description="覆盖默认模型 (如 gemini-3.6-flash)",
     )
     download_dir: str = Field(
-        default="downloads", title="下载目录", description="相对项目根"
+        default=os.getenv("DOWNLOAD_DIR", "downloads").strip() or "downloads",
+        title="下载目录",
+        description="相对项目根",
     )
     visual_effects: bool = Field(
-        default=True, title="鼠标点击高亮", description="点击与定位框可视化"
+        default=VISUAL_EFFECTS, title="鼠标点击高亮", description="点击与定位框可视化"
     )
 
 
@@ -56,19 +63,6 @@ _CONFIG_KEYS = {
     "download_dir": "DOWNLOAD_DIR",
     "visual_effects": "VISUAL_EFFECTS",
 }
-
-
-def _default_form() -> PluginConfigForm:
-    """以当前生效配置为表单默认值 (用户可少改字段直接提交)。"""
-    return PluginConfigForm(
-        project_dir=PROJECT_DIR,
-        cdp_url=CDP_URL,
-        vision_provider=os.getenv("VISION_PROVIDER", "auto").strip() or "auto",
-        vision_model=os.getenv("VISION_MODEL", "gemini-3.6-flash").strip()
-        or "gemini-3.6-flash",
-        download_dir=os.getenv("DOWNLOAD_DIR", "downloads").strip() or "downloads",
-        visual_effects=VISUAL_EFFECTS,
-    )
 
 
 def _update_env_file(path: Path, values: dict) -> None:
@@ -101,19 +95,25 @@ async def plugin_setup_impl(ctx: Context = None) -> dict:
     if ctx is None:
         return {
             "status": "error",
-            "message": f"当前客户端不支持交互式表单, 请手动编辑 {user_env_path()}",
+            "message": (
+                "当前客户端不支持交互式表单。Claude Desktop 请改用 setup_form "
+                "工具 (Apps 原生表单); 或手动编辑 "
+                f"{user_env_path()} 并重启客户端。"
+            ),
         }
     try:
         result = await ctx.elicit(
             "请填写插件环境变量配置 (保存后重启客户端生效)",
-            _default_form(),
+            PluginConfigForm,
         )
     except Exception as e:  # noqa: BLE001 — 非交互客户端降级
         return {
             "status": "error",
             "message": (
-                f"交互式表单不可用 ({e})。请手动编辑 {user_env_path()} "
-                "并重启客户端。"
+                f"交互式表单不可用 ({e})。"
+                "若当前为 Claude Desktop, 请改用 setup_form 工具 "
+                "(Apps 原生表单 UI); "
+                f"或手动编辑 {user_env_path()} 并重启客户端。"
             ),
         }
     if not isinstance(result, AcceptedElicitation):

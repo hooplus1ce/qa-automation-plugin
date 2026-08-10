@@ -112,25 +112,15 @@ class TestPluginSetup(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "error")
         self.assertIn("手动编辑", result["message"])
 
-    def test_default_form_prefills_current_config(self):
-        with patch.dict(
-            os.environ,
-            {
-                "VISION_PROVIDER": "tokenhub",
-                "VISION_MODEL": "glm-5v-turbo",
-                "DOWNLOAD_DIR": "qa-downloads",
-            },
-            clear=True,
-        ), patch.object(setup, "PROJECT_DIR", "D:/Proj"), patch.object(
-            setup, "CDP_URL", "http://127.0.0.1:9223"
-        ), patch.object(setup, "VISUAL_EFFECTS", False):
-            form = setup._default_form()
-        self.assertEqual(form.project_dir, "D:/Proj")
-        self.assertEqual(form.cdp_url, "http://127.0.0.1:9223")
-        self.assertEqual(form.vision_provider, "tokenhub")
-        self.assertEqual(form.vision_model, "glm-5v-turbo")
-        self.assertEqual(form.download_dir, "qa-downloads")
-        self.assertFalse(form.visual_effects)
+    def test_form_constructible_with_defaults(self):
+        """表单默认值齐全 (导入时与配置同步), 可无参构造。"""
+        form = PluginConfigForm()
+        self.assertTrue(form.project_dir)
+        self.assertTrue(form.cdp_url)
+        self.assertIn(form.vision_provider, ("auto", "antigravity", "tokenhub", "custom"))
+        self.assertTrue(form.vision_model)
+        self.assertTrue(form.download_dir)
+        self.assertIsInstance(form.visual_effects, bool)
 
     def test_handle_config_form_writes_env(self):
         """Desktop FormInput 回调: 校验后写入用户级 .env, 返回重启提示。"""

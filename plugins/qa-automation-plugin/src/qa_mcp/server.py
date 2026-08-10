@@ -19,19 +19,22 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastmcp import Context, FastMCP
-from fastmcp.apps.choice import Choice
-from fastmcp.apps.form import FormInput
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 
 from pathlib import Path
 
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
-from qa_mcp.config import EVIDENCE_DIR, OUTPUT_DIR, TOOL_MAX_EXECUTION_MS
+from qa_mcp.apps_interactive import ApprovalWithTimeout, ChoiceWithTimeout, ConfigFormApp
+from qa_mcp.config import (
+    EVIDENCE_DIR,
+    INTERACTIVE_UI_ENABLED,
+    OUTPUT_DIR,
+    TOOL_MAX_EXECUTION_MS,
+)
 from qa_mcp.providers import BrowserAutomationProvider, VTableAutomationProvider
 from qa_mcp.tools.browser import browser_mgr
 from qa_mcp.tools.recorder import SESSION_KEY
-from qa_mcp.tools.setup import PluginConfigForm, handle_config_form
 from qa_mcp.utils.excel_render import render_shadcn_excel
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -146,19 +149,24 @@ mcp = FastMCP(
         BrowserAutomationProvider(),
         VTableAutomationProvider(),
         SkillsDirectoryProvider(roots=skills_dir),
-        # Claude Desktop 交互式 UI (FastMCP Apps): 配置表单 + 选择卡片。
-        # Claude Code (TUI) 不渲染 Apps UI, 自动降级走 elicitation 通道
-        # (plugin_setup / describe_image interactive=True)。
-        FormInput(
-            model=PluginConfigForm,
-            name="QA 配置",
-            title="插件配置",
-            tool_name="setup_form",
-            submit_text="保存配置",
-            on_submit=handle_config_form,
-            send_message=True,
+        # Claude Desktop 交互式 UI (FastMCP Apps): 配置表单 + 选择/审批卡片。
+        # 由 INTERACTIVE_UI_ENABLED 总开关控制: 关闭时不注册 (工具描述不进
+        # 上下文, 省 token), 所有 elicitation 交互点直接走默认值。
+        # Claude Code (TUI) 不渲染 Apps UI, 自动降级走 elicitation 通道。
+        *(
+            [
+                ConfigFormApp(name="QA 配置", title="插件配置", submit_text="保存配置"),
+                ChoiceWithTimeout(name="QA 选择", title="请选择"),
+                ApprovalWithTimeout(
+                    name="QA 审批",
+                    title="操作确认",
+                    approve_text="继续执行",
+                    reject_text="取消",
+                ),
+            ]
+            if INTERACTIVE_UI_ENABLED
+            else []
         ),
-        Choice(name="QA 选择", title="请选择"),
     ],
     lifespan=server_lifespan,
 )

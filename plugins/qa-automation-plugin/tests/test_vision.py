@@ -616,7 +616,7 @@ class TestInteractiveElicitation(unittest.IsolatedAsyncioTestCase):
                         ctx=ctx,
                     )
         self.assertEqual(result["status"], "success")
-        self.assertEqual(result["reasoning_effort"], "low")  # auto: 5 字问题 → low
+        self.assertEqual(result["reasoning_effort"], "medium")  # 拒绝 → 默认 standard
 
     async def test_interactive_unsupported_client_degrades(self):
         """客户端不支持 elicitation (抛异常) → 自动降级 auto, 识别继续。"""
@@ -637,7 +637,7 @@ class TestInteractiveElicitation(unittest.IsolatedAsyncioTestCase):
                         ctx=ctx,
                     )
         self.assertEqual(result["status"], "success")
-        self.assertEqual(result["reasoning_effort"], "low")
+        self.assertEqual(result["reasoning_effort"], "medium")  # 降级 → 默认 standard
 
     async def test_interactive_false_skips_elicit(self):
         """interactive=False: 不弹窗。"""
