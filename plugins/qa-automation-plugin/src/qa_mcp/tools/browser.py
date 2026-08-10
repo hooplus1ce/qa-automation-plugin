@@ -821,6 +821,54 @@ async def _wait_visible_or_first(
             return lc
         raise
     return lc
+async def _visible_ancestor_path(target, lc) -> Optional[str]:
+    """目标元素存在但不可见时, 返回最近可见祖先的 CSS 路径 (nth-child 链)。
+
+    典型场景: antd Select 空值时 .ant-select-selection-selected-value 为
+    display:none, 点击其最近可见祖先 (如 .ant-select-selection 本体) 即可
+    正常展开下拉。找不到可见祖先 (或祖先为 body/html) 返回 None。
+    """
+    try:
+        handle = await lc.first.element_handle()
+    except Exception:
+        return None
+    try:
+        path = await handle.evaluate(
+            """(el) => {
+                let cur = el;
+                let depth = 0;
+                while (cur && cur.nodeType === 1) {
+                    const r = cur.getBoundingClientRect();
+                    const cs = getComputedStyle(cur);
+                    if (r.width > 0 && r.height > 0 &&
+                        cs.display !== 'none' &&
+                        cs.visibility !== 'hidden' && cs.visibility !== 'collapse') {
+                        const tag = cur.tagName.toLowerCase();
+                        if (tag === 'body' || tag === 'html') return null;
+                        const parts = [];
+                        let node = cur;
+                        while (node && node.nodeType === 1 && node !== document.documentElement) {
+                            const t = node.tagName.toLowerCase();
+                            const parent = node.parentElement;
+                            const idx = parent ? Array.from(parent.children).indexOf(node) + 1 : 1;
+                            parts.unshift(t + ':nth-child(' + idx + ')');
+                            node = parent;
+                        }
+                        return parts.join(' > ');
+                    }
+                    cur = cur.parentElement;
+                    // 超过 6 层仍无可见祖先 (如页面动画期整块区域零尺寸):
+                    // 不兜底, 交由调用方按原定位超时报错。
+                    if (++depth > 6) return null;
+                }
+                return null;
+            }"""
+        )
+        return path or None
+    except Exception:
+        return None
+
+
 def _is_actionability_failure(e: Exception) -> bool:
     """判断点击/悬停/聚焦失败是否为 actionability 检查类 (可 force 兜底)。
     Playwright actionability 失败类型: 持续动画 (not stable)、元素被遮挡
@@ -922,23 +970,43 @@ async def _do_click(
     action_label = description or full_selector or "点击"
     viz_result = None
     frame_path_list: List[str] = []
+    clicked_ancestor: Optional[str] = None
     if not viz:
         viz_result = await _visual_show(page, (), (), "", "", enabled=False)
 
     async def _dom_click_once():
         # 每次执行/重试重新解析目标与 locator: 覆盖 SPA 重渲染 detach、
         # iframe 重新导航等导致旧 locator 失效的场景。
-        nonlocal frame_path_list, viz_result
+        nonlocal frame_path_list, viz_result, clicked_ancestor
+        clicked_ancestor = None
         target, frame_path_list = await _resolve_frame_target(page, iframe_selector)
         if locator_kind == "role":
             lc = target.get_by_role(role, name=name or None)
         else:
             lc = target.locator(full_selector)
         try:
-            await lc.wait_for(state="visible", timeout=ELEMENT_WAIT_TIMEOUT_MS)
+            # strict violation (多元素匹配) 自动取 .first 消歧, 避免整次失败
+            lc = await _wait_visible_or_first(lc, action_label, ELEMENT_WAIT_TIMEOUT_MS)
         except Exception as e:
-            raise await _enhance_locator_timeout(e, lc, action_label) from e
-        await lc.scroll_into_view_if_needed()
+            err = await _enhance_locator_timeout(e, lc, action_label)
+            # 元素存在但不可见 (典型: antd 空下拉的 .ant-select-selection-selected-value
+            # 为 display:none): 回退点击最近可见祖先 (如 .ant-select-selection 本体),
+            # 让下拉正常展开; 无可见祖先则按原样报定位超时。
+            ancestor_path = await _visible_ancestor_path(target, lc)
+            if not ancestor_path:
+                raise err from e
+            logger.warning(
+                f"[{action_label}] 目标元素存在但不可见, 回退点击最近可见祖先 [{ancestor_path}]"
+            )
+            lc = target.locator(ancestor_path)
+            await lc.wait_for(state="visible", timeout=ELEMENT_WAIT_TIMEOUT_MS)
+            clicked_ancestor = ancestor_path
+        # 滚动降级: 持续动画页面 (VTable 重绘/antd 动效) 会使稳定等待超时 (默认 30s),
+        # 此时元素往往已在视口内, click 内部自带滚动, 无需硬等稳定。
+        try:
+            await asyncio.wait_for(lc.scroll_into_view_if_needed(), timeout=5)
+        except (asyncio.TimeoutError, Exception):
+            pass
 
         # 动作前视觉: 光标平滑移动到目标中心 + 高亮框 + 动作标签
         box = await lc.bounding_box()
@@ -951,10 +1019,26 @@ async def _do_click(
                 action="click",
                 enabled=True,
             )
-        if click_kind == "double":
-            await lc.dblclick()
-        else:
-            await lc.click()
+        # 点击执行: 常规 actionability (含 stable) 等待; 持续动画页面 stable 检查
+        # 会挂到默认 30s, 故先给短超时, 超时后 force 兜底 (跳过 actionability 直接派发事件)。
+        click_timeout = max(ELEMENT_WAIT_TIMEOUT_MS, 5000)
+        try:
+            if click_kind == "double":
+                await lc.dblclick(timeout=click_timeout)
+            else:
+                await lc.click(timeout=click_timeout)
+        except Exception as e:
+            if _is_actionability_failure(e):
+                logger.warning(
+                    f"[{action_label}] actionability 检查未通过 (持续动画/遮挡/不在视口), "
+                    f"force 点击兜底: {e}"
+                )
+                if click_kind == "double":
+                    await lc.dblclick(force=True)
+                else:
+                    await lc.click(force=True)
+            else:
+                raise
         return box
 
     try:
@@ -971,6 +1055,7 @@ async def _do_click(
         "click_type": click_kind,
         "selector": full_selector,
         "frame_path": frame_path_list,
+        "clicked_ancestor": clicked_ancestor,
         "element_box": {"x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"]} if box else None,
         "element_center": {"x": round(box["x"] + box["width"] / 2, 2), "y": round(box["y"] + box["height"] / 2, 2)} if box else None,
         "description": description,
@@ -1011,10 +1096,16 @@ async def _do_fill(
         target, frame_path_list = await _resolve_frame_target(page, iframe_selector)
         lc = target.locator(full_selector)
         try:
-            await lc.wait_for(state="visible", timeout=ELEMENT_WAIT_TIMEOUT_MS)
+            # strict violation (多元素匹配) 自动取 .first 消歧, 避免整次失败
+            lc = await _wait_visible_or_first(lc, action_label, ELEMENT_WAIT_TIMEOUT_MS)
         except Exception as e:
             raise await _enhance_locator_timeout(e, lc, action_label) from e
-        await lc.scroll_into_view_if_needed()
+        # 滚动降级: 持续动画页面 (VTable 重绘/antd 动效) 会使稳定等待超时 (默认 30s),
+        # 此时元素往往已在视口内, click/fill 内部自带滚动, 无需硬等稳定。
+        try:
+            await asyncio.wait_for(lc.scroll_into_view_if_needed(), timeout=5)
+        except (asyncio.TimeoutError, Exception):
+            pass
 
         # 动作前视觉: 光标移动至输入框 + 高亮框 + 动作标签
         box = await lc.bounding_box()
@@ -1027,8 +1118,18 @@ async def _do_fill(
                 action="input",
                 enabled=True,
             )
-        # 先点击聚焦 (对齐人工操作: 触发组件的 focus/激活逻辑)
-        await lc.click()
+        # 先点击聚焦 (对齐人工操作: 触发组件的 focus/激活逻辑);
+        # actionability 检查失败 (持续动画/遮挡等) → force 聚焦兜底。
+        try:
+            await lc.click(timeout=max(ELEMENT_WAIT_TIMEOUT_MS, 5000))
+        except Exception as e:
+            if _is_actionability_failure(e):
+                logger.warning(
+                    f"[{action_label}] actionability 检查未通过, force 点击聚焦兜底: {e}"
+                )
+                await lc.click(force=True)
+            else:
+                raise
         if method == "fill":
             await lc.fill(value or "")
         else:

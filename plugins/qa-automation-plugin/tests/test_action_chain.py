@@ -41,10 +41,10 @@ class FakeLocator:
     async def bounding_box(self):
         return None
 
-    async def click(self):
+    async def click(self, timeout=None, force=False):
         self.page.events.append(("click", self.css))
 
-    async def dblclick(self):
+    async def dblclick(self, timeout=None, force=False):
         self.page.events.append(("dblclick", self.css))
 
     async def fill(self, value):
