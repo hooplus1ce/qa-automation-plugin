@@ -47,18 +47,6 @@ class FakeLocator:
         self.events.append(("click",))
 
 
-class FakeSelectTrigger(FakeLocator):
-    """带 class 属性的 select 触发框 (antd 3: selectUidXXX 与展开层 dropdownUidXXX 同源)。"""
-
-    def __init__(self, class_name="selectUidabc123  ant-select"):
-        super().__init__()
-        self.class_name = class_name
-
-    async def get_attribute(self, name):
-        self.events.append(("get_attribute", name))
-        return self.class_name
-
-
 class FakeOption(FakeLocator):
     def __init__(self, texts=None):
         super().__init__(count=1)
@@ -171,45 +159,6 @@ class UIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("清洗方案B", message)
         # 歧义时不得点击任何选项
         self.assertNotIn(("click",), dropdown.option.events)
-
-    async def test_ant_select_expanded_dropdown_clicked_directly(self):
-        """目标下拉已展开 (uid 关联命中) 时直接点选项, 不得点击触发框 (会关掉下拉)。"""
-        adapter = AntDesignAdapter()
-        dropdown = FakeDropdown(texts=["中班"])
-        page = FakePage(dropdown=dropdown)
-        trigger = FakeSelectTrigger(class_name="selectUidbdf6d3819d693682c06b4d2bedac532c  ant-select")
-
-        await adapter.select_option(page, trigger, "中班")
-
-        # 未点击触发框 (展开态直接点选项)
-        self.assertNotIn(("click",), trigger.events)
-        self.assertIn(".dropdownUidbdf6d3819d693682c06b4d2bedac532c:visible", page.locator_selector)
-        self.assertIn(("click",), dropdown.option.events)
-
-    async def test_ant_select_expanded_without_uid_falls_back(self):
-        """触发框无 selectUid (antd 4/5 等) 时回退常规"点击触发框重开"流程。"""
-        adapter = AntDesignAdapter()
-        dropdown = FakeDropdown(texts=["白班"])
-        page = FakePage(dropdown=dropdown)
-        trigger = FakeSelectTrigger(class_name="legions-pro-select ant-select")
-
-        await adapter.select_option(page, trigger, "白班")
-
-        self.assertIn(("click",), trigger.events)
-        self.assertIn(("click",), dropdown.option.events)
-
-    async def test_ant_select_expanded_option_missing_falls_back(self):
-        """展开层里没有目标选项 (异步加载/uid 误命中残留层) 时回退常规流程并报错。"""
-        adapter = AntDesignAdapter()
-        dropdown = FakeDropdown(texts=["白班"])
-        page = FakePage(dropdown=dropdown)
-        trigger = FakeSelectTrigger(class_name="selectUidabc123  ant-select")
-
-        with self.assertRaises(RuntimeError) as ctx:
-            await adapter.select_option(page, trigger, "中班")
-        self.assertIn("中班", str(ctx.exception))
-        # 回退后触发框被点击重开, 常规流程照常执行
-        self.assertIn(("click",), trigger.events)
 
     async def test_ant_select_exact_match_wins_over_substring(self):
         """"含过敏原" 精确命中一个选项时, 不得因"不含过敏原"包含子串而误选/误报。"""

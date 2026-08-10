@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import re
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -77,12 +76,6 @@ class AntDesignAdapter(UIAdapter):
         return "ant_design"
 
     async def select_option(self, page: UIContext, trigger_locator: Locator, option_text: str) -> None:
-        # 已展开下拉检测: 目标 select 的下拉已在展开状态时, 直接点选项即可;
-        # 否则无条件先点击触发框会把已开的下拉"关掉", 等新下拉挂载必然超时
-        # (实测: 动作链/中断后残留展开态, select_option 卡到单步看门狗强杀)。
-        if await self._try_click_expanded(page, trigger_locator, option_text):
-            return
-
         await trigger_locator.click()
 
         # 连续下拉场景 (动作链里挨个选下拉) 存在动画竞态: 上一个下拉的收起动画
@@ -111,30 +104,6 @@ class AntDesignAdapter(UIAdapter):
             await asyncio.sleep(SELECT_POLL_INTERVAL_MS / 1000)
 
         raise RuntimeError(f"Ant Design 下拉选项不存在: {option_text}")
-
-    async def _try_click_expanded(
-        self, page: UIContext, trigger_locator: Locator, option_text: str
-    ) -> bool:
-        """目标下拉已展开时直接点击选项。
-
-        antd 3 的 select 组件与展开层共享 uid: 触发框类名 selectUidXXX ↔
-        展开层类名 dropdownUidXXX。从触发框提取 uid 定位对应展开层, 层可见且
-        选项命中即直接点击 — 跳过"点击触发框→关闭→等新下拉挂载"的完整流程。
-
-        无法关联 uid (antd 4/5 或其他组件) 时返回 False, 由调用方走常规
-        "点击触发框重开"流程, 行为与旧版一致。探测任何异常同样回退常规流程。
-        """
-        try:
-            cls = await trigger_locator.get_attribute("class") or ""
-            m = re.search(r"selectUid(\w+)", cls)
-            if not m:
-                return False
-            dropdown = page.locator(f".ant-select-dropdown.dropdownUid{m.group(1)}:visible")
-            if await dropdown.count() > 0:
-                return await self._click_option_in(dropdown, option_text)
-        except Exception as e:
-            logger.warning(f"已展开下拉探测失败, 走常规选择流程: {e}")
-        return False
 
     async def _click_option_in(self, dropdown: Locator, option_text: str) -> bool:
         """在下拉层内按文本定位选项并点击。

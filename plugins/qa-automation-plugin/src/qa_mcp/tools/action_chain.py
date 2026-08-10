@@ -1,17 +1,15 @@
-import asyncio
 import logging
 
 from fastmcp import Context
 from typing import Any, Dict, List, Optional
 
-from qa_mcp.config import ACTION_STEP_TIMEOUT_MS, ELEMENT_WAIT_TIMEOUT_MS
+from qa_mcp.config import ELEMENT_WAIT_TIMEOUT_MS
 from qa_mcp.tools.browser import (
     browser_mgr,
     _do_click,
     _do_fill,
     _resolve_frame_target,
     _enhance_locator_timeout,
-    _wait_visible_or_first,
     retry_ui_action,
     observe_after_click,
     snapshot_navigation,
@@ -22,16 +20,11 @@ logger = logging.getLogger("mcp_automation.action_chain")
 
 
 def _action_key(act: Dict[str, Any]) -> str:
-    """动作定位指纹: 相同 (by, selector | role+name) 且相同 iframe 域视为同一尝试。
-
-    iframe_selector 是定位的一部分: 同一 selector 在顶层与 iframe 内是两个
-    不同尝试 (规则 0 的 iframe 穿透变体), 不含 iframe 维度会把兜底变体去重吞掉。
-    """
+    """动作定位指纹: 相同 (by, selector | role+name) 视为同一尝试, 用于降级去重。"""
     by = str(act.get("by", "css")).lower()
-    frame = str(act.get("iframe_selector") or "")
     if by == "role":
-        return f"{frame}|role|{act.get('role')}|{act.get('name')}"
-    return f"{frame}|{by}|{act.get('selector')}"
+        return f"role|{act.get('role')}|{act.get('name')}"
+    return f"{by}|{act.get('selector')}"
 
 
 def build_action_fallbacks(act: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -42,9 +35,6 @@ def build_action_fallbacks(act: Dict[str, Any]) -> List[Dict[str, Any]]:
       2) execute_action_chain_impl 执行时自动附加 (显式 fallbacks 之后)。
 
     规则:
-      0. 未指定 iframe_selector: 自动生成「可见 iframe 内定位」变体。业务页
-         (analyze 的元素 frame_path 均在 iframe 内) 顶层定位必然失败, 这是
-         动作链最常见失败源; 带 iframe 穿透的兜底让链路不再依赖调用方记忆。
       1. antd 下拉选项点击 (click/press + css 含 li 与 [title=]):
          生成全部 nth 位次变体 (nth=0..3, 排除主定位已用的位次): 多 select 的
          dropdown 常驻 DOM (modal 关闭不卸载), 激活层位次不定, 逐个位次尝试。
@@ -57,10 +47,6 @@ def build_action_fallbacks(act: Dict[str, Any]) -> List[Dict[str, Any]]:
     by = str(act.get("by", "css")).lower()
     selector = act.get("selector")
     fallbacks: List[Dict[str, Any]] = []
-
-    # 规则 0: iframe 穿透兜底 (对所有动作生效, 优先级最高 — 多数业务页元素在 iframe 内)
-    if not act.get("iframe_selector"):
-        fallbacks.append({**act, "iframe_selector": "div[aria-hidden=false] iframe"})
 
     if action not in ("click", "press"):
         return fallbacks
@@ -94,62 +80,34 @@ def build_action_fallbacks(act: Dict[str, Any]) -> List[Dict[str, Any]]:
     return fallbacks
 
 
-class _OptionNotVisibleError(RuntimeError):
-    """下拉选项快速失败异常: 目标下拉未展开/已关闭, li 不存在或不可见。
-
-    抛出后执行器不等待 10s 可见超时, 立即尝试下一定位方案, 全部失败时
-    错误信息保留该原因, 引导调用方先展开对应下拉再点击。
-    """
-
-
-async def _precheck_li_option(
+async def _is_css_nth_visible(
     page,
     attempt: Dict[str, Any],
-) -> None:
-    """下拉选项可见性预检: 对 click/press + css `li[title=...]` 定位生效。
-
-    场景: antd dropdown 关闭时 li 随层卸载 (或隐藏), 若调用方未先展开对应
-    下拉就点击选项, 元素不存在, 每个定位方案都会干等 10s visible 超时,
-    整条链 30s 看门狗强杀 (观感=卡死)。预检在超时看门狗之外运行, 用独立
-    短超时 (5s) 保护 CDP 半开; 元素不存在/不可见时秒级抛 _OptionNotVisibleError,
-    不耗等待超时。
-
-    覆盖两层场景:
-      1) 主定位 li[title=...] 无 nth: 下拉未展开 → 快速失败 (原逻辑直接等 10s);
-      2) nth 变体: antd 常驻 dropdown 中多数层隐藏 → 快速跳过 (替代原 _is_css_nth_visible)。
-
-    预检自身异常 (CDP 半开/解析错误) 时放行, 交由真实定位决定成败,
-    不因预检引入新失败。
+) -> bool:
+    """nth 定位变体可见性预检: antd 常驻 dropdown 中多数层隐藏, 跳过它们可避免
+    每次 6s 等待超时。仅对 antd 选项点击变体 (click/press + css 含 li 与 [title=]
+    且带 `>> nth=`) 生效; 其他 nth 用法 (如表格行内定位) 不预检, 保持原语义。
+    预检异常时放行 (交由真实定位决定成败), 不因预检引入新失败。
     """
     action = str(attempt.get("action", "")).lower()
     if action not in ("click", "press"):
-        return
+        return True
     if str(attempt.get("by", "css")).lower() != "css":
-        return
+        return True
     selector = attempt.get("selector")
-    if not selector:
-        return
+    if not selector or ">> nth=" not in str(selector):
+        return True
     sel = str(selector)
     if "li" not in sel or "[title=" not in sel:
-        return
+        return True
     try:
-        target, _ = await asyncio.wait_for(
-            _resolve_frame_target(page, attempt.get("iframe_selector")), timeout=5
-        )
+        target, _ = await _resolve_frame_target(page, attempt.get("iframe_selector"))
         locator = target.locator(sel)
         if await locator.count() == 0:
-            raise _OptionNotVisibleError(
-                f"下拉选项 {sel} 不存在: 对应下拉未展开或已关闭"
-            )
-        if not await asyncio.wait_for(locator.first.is_visible(), timeout=2):
-            raise _OptionNotVisibleError(
-                f"下拉选项 {sel} 不可见: 对应下拉未展开或已关闭"
-            )
-    except _OptionNotVisibleError:
-        raise
+            return False
+        return await locator.first.is_visible()
     except Exception:
-        # 预检异常放行: 交由真实定位 (10s 等待 + 重试) 决定成败
-        return
+        return True
 
 
 async def _do_select_option(
@@ -178,7 +136,7 @@ async def _do_select_option(
         target, frame_path_list = await _resolve_frame_target(page, iframe_selector)
         locator = target.locator(full_selector)
         try:
-            locator = await _wait_visible_or_first(locator, action_label, ELEMENT_WAIT_TIMEOUT_MS)
+            await locator.wait_for(state="visible", timeout=ELEMENT_WAIT_TIMEOUT_MS)
         except Exception as e:
             raise await _enhance_locator_timeout(e, locator, action_label) from e
         await locator.scroll_into_view_if_needed()
@@ -219,7 +177,7 @@ async def _do_press(
         target, frame_path_list = await _resolve_frame_target(page, iframe_selector)
         locator = target.locator(full_selector)
         try:
-            locator = await _wait_visible_or_first(locator, action_label, ELEMENT_WAIT_TIMEOUT_MS)
+            await locator.wait_for(state="visible", timeout=ELEMENT_WAIT_TIMEOUT_MS)
         except Exception as e:
             raise await _enhance_locator_timeout(e, locator, action_label) from e
         await locator.press(key)
@@ -303,13 +261,7 @@ async def execute_action_chain_impl(
     before = await snapshot_navigation(page)
 
     async def _run_single(act: Dict[str, Any]) -> None:
-        """单个动作执行体: 校验 + 分发到各执行函数。
-
-        每次动作实时从 manager 获取 page (而非闭包捕获): 前序动作被超时强杀并
-        recover 重建连接后, 后续动作自动切到新连接, 避免旧 page 引用半开挂死。
-        """
-        nonlocal page
-        page = await browser_mgr.get_page()
+        """单个动作执行体: 校验 + 分发到各执行函数。"""
         action = str(act.get("action", "")).lower()
         by = str(act.get("by", "css")).lower()
         selector = act.get("selector")
@@ -369,35 +321,13 @@ async def execute_action_chain_impl(
                 if key in seen:
                     continue
                 seen.add(key)
-                # 下拉选项预检: 对应下拉未展开/已关闭时 li 不存在或不可见,
-                # 秒级快速失败并记录原因, 避免每个方案干等 10s 把整条链堵死
-                # (30s 看门狗强杀 + CDP 重建, 观感=卡死)。
-                try:
-                    await _precheck_li_option(page, attempt)
-                except _OptionNotVisibleError as e:
-                    last_err = e
-                    tried += 1
+                # nth 变体预检: antd 常驻 dropdown 中隐藏层直接跳过 (不耗等待超时)
+                if not await _is_css_nth_visible(page, attempt):
                     continue
                 tried += 1
                 try:
-                    # 单步硬上限: CDP 挂死时 Playwright 动作级 timeout 不生效,
-                    # 用外层 wait_for 兜底, 防止一个死动作把整条链堵死。
-                    await asyncio.wait_for(
-                        _run_single(attempt), timeout=ACTION_STEP_TIMEOUT_MS / 1000
-                    )
+                    await _run_single(attempt)
                     break
-                except asyncio.TimeoutError:
-                    last_err = RuntimeError(
-                        f"动作执行超过 {ACTION_STEP_TIMEOUT_MS}ms 上限, 已强制中断该步"
-                    )
-                    # 强杀一个 CDP 请求半开的协程后, Playwright 底层可能残留 pending
-                    # 协议请求, 后续所有工具调用会排队挂死 (典型症状: 单独调用成功、
-                    # 紧随失败动作之后调用超时)。立即重建连接自愈, 不阻断原错误抛出。
-                    try:
-                        await browser_mgr.recover(preferred_url=page.url)
-                        logger.warning("动作超时强杀后已重建 CDP 连接")
-                    except Exception as rec_exc:
-                        logger.warning(f"动作超时后连接重建失败: {rec_exc}")
                 except Exception as e:
                     last_err = e
             else:
@@ -417,8 +347,6 @@ async def execute_action_chain_impl(
             })
 
     # 链尾统一观察: 浮层/弹窗/消息提示 + tab 页跳转 + iframe 跳转
-    # (重新获取 page: 链内若发生过 recover, 旧 page 引用已失效)
-    page = await browser_mgr.get_page()
     observation = await observe_after_click(page, before, detail=detail)
     return {
         "status": "success" if not failed else "partial",

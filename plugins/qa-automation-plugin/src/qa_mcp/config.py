@@ -152,21 +152,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# 元素定位等待超时 (click/fill/select_option/press 的 wait_for visible)。
-# 设计哲学: 快速失败优先 — 定位是高频失败点, 不应靠长等待覆盖慢页面,
-# 短超时 + 重试让错误快速浮出 (配合动作链 li 选项预检, 失败秒级可见)。
-ELEMENT_WAIT_TIMEOUT_MS = _env_int("ELEMENT_WAIT_TIMEOUT_MS", 3000)
-# 全局执行看门狗: 任何工具调用超过该上限即强制中断并释放串行队列。
-# 必要性: Chrome 假死/CDP 连接半开时 Playwright 协议调用可能无限等待,
-# 动作级 timeout 不会触发 (等待的是协议响应); 该上限远小于客户端 30min 超时。
-TOOL_MAX_EXECUTION_MS = _env_int("TOOL_MAX_EXECUTION_MS", 300000)
-# 动作链单步执行上限: 单个 click/fill/select/press 超过即记为失败,
-# 防止链中一个死动作把整条链及后续所有工具调用堵死。
-# 默认 15s: 覆盖 定位(3s) + 重试(2次内) + 逐字输入(120字符@100ms≈12s) 的最坏
-# 合法场景; 超过即为真异常, 快速失败并重建连接, 不让 30s 挂死拖慢整条链。
-ACTION_STEP_TIMEOUT_MS = _env_int("ACTION_STEP_TIMEOUT_MS", 15000)
+# 元素定位等待超时 (click/fill/select_option/press 的 wait_for visible)
+ELEMENT_WAIT_TIMEOUT_MS = _env_int("ELEMENT_WAIT_TIMEOUT_MS", 6000)
 # 点击/输入后的统一观察轮询窗口 (动态层/消息捕获)
-OBSERVE_WAIT_MS = _env_int("OBSERVE_WAIT_MS", 1200)
+OBSERVE_WAIT_MS = _env_int("OBSERVE_WAIT_MS", 1500)
 # 交互式 UI (elicitation 弹窗/Apps 卡片) 等待用户操作的超时秒数;
 # 超时未操作默认按"直接进入下一步"处理 (危险确认类可在工具层配置)
 INTERACT_TIMEOUT_S = _env_int("INTERACT_TIMEOUT_S", 10)
@@ -181,14 +170,12 @@ INTERACTIVE_UI_ENABLED = os.getenv("INTERACTIVE_UI_ENABLED", "false").strip().lo
     "on",
 )
 # Ant Design 下拉: 首次等待新下拉挂载; 后续每轮重试等待; 重试总轮数; 重试间隔
-# (首等 3s 覆盖下拉动画; 轮询 6 次 × 200ms 快速兜底, 不长时间干等)
-SELECT_WAIT_FIRST_MS = _env_int("SELECT_WAIT_FIRST_MS", 3000)
+SELECT_WAIT_FIRST_MS = _env_int("SELECT_WAIT_FIRST_MS", 5000)
 SELECT_WAIT_RETRY_MS = _env_int("SELECT_WAIT_RETRY_MS", 1000)
-SELECT_RETRY_ATTEMPTS = _env_int("SELECT_RETRY_ATTEMPTS", 4)
+SELECT_RETRY_ATTEMPTS = _env_int("SELECT_RETRY_ATTEMPTS", 6)
 SELECT_POLL_INTERVAL_MS = _env_int("SELECT_POLL_INTERVAL_MS", 200)
 # 统一"定位-执行"重试 (SPA 重渲染/元素 detach/短暂遮挡): 尝试次数与间隔
-# (配合 3s 短定位 + 快速失败预检, 2 次重试即整体有界 ~9s, 不靠多次重试兜底)
-ACTION_RETRY_ATTEMPTS = _env_int("ACTION_RETRY_ATTEMPTS", 2)
+ACTION_RETRY_ATTEMPTS = _env_int("ACTION_RETRY_ATTEMPTS", 3)
 ACTION_RETRY_BACKOFF_MS = _env_int("ACTION_RETRY_BACKOFF_MS", 500)
 # CDP 首次连接失败退避重试: 次数与初始间隔 (指数退避 x2)
 CONNECT_RETRY_ATTEMPTS = _env_int("CONNECT_RETRY_ATTEMPTS", 3)

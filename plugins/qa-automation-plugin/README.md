@@ -130,9 +130,7 @@
      （见下节"视觉模型（vision role）配置与使用"）。
    - `VISION_MODEL`: 覆盖视觉模型名（默认 `gemini-3.6-flash`）。
    - `VISION_API_KEY`: 腾讯云 TokenHub GLM-5V 视觉 API Key（tokenhub 通道）。
-   - `ELEMENT_WAIT_TIMEOUT_MS`: 元素定位等待超时（click/fill/select/press 的 wait_for visible，默认 `10000`ms）。
-   - `ACTION_STEP_TIMEOUT_MS`: 动作链单步执行上限（默认 `90000`ms；单步超时记为失败，防止链中一个死动作堵死整条链）。
-   - `TOOL_MAX_EXECUTION_MS`: 全局工具执行看门狗（默认 `300000`ms；Chrome 假死/CDP 连接半开时协议调用可能无限等待，超时后强制中断、释放串行队列并重置浏览器连接）。
+   - `ELEMENT_WAIT_TIMEOUT_MS`: 元素定位等待超时（click/fill/select/press 的 wait_for visible，默认 `6000`ms）。
 
 ### 视觉模型（vision role）配置与使用
 
