@@ -154,6 +154,12 @@ def _env_int(name: str, default: int) -> int:
 
 # 元素定位等待超时 (click/fill/select_option/press 的 wait_for visible)
 ELEMENT_WAIT_TIMEOUT_MS = _env_int("ELEMENT_WAIT_TIMEOUT_MS", 6000)
+# 动作链单步执行上限: 单个 click/fill/select/press 超过即记为失败,
+# 防止链中一个死动作把整条链及后续所有工具调用堵死 (看门狗配套, 恢复自
+# 远程 revert 前版本; CDP 挂死时 Playwright 动作级 timeout 不生效, 需外层限时)
+ACTION_STEP_TIMEOUT_MS = _env_int("ACTION_STEP_TIMEOUT_MS", 15000)
+# 全局工具执行看门狗: 任何工具调用超过该上限即强制中断并释放串行队列
+TOOL_MAX_EXECUTION_MS = _env_int("TOOL_MAX_EXECUTION_MS", 300000)
 # 点击/输入后的统一观察轮询窗口 (动态层/消息捕获)
 OBSERVE_WAIT_MS = _env_int("OBSERVE_WAIT_MS", 1500)
 # 交互式 UI (elicitation 弹窗/Apps 卡片) 等待用户操作的超时秒数;

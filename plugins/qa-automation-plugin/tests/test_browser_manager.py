@@ -6,7 +6,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from qa_mcp.tools.browser import BrowserManager  # noqa: E402
+from qa_mcp.tools.browser import BrowserManager, _fill_watchdog_timeout  # noqa: E402
 
 
 class FakeTab:
@@ -101,6 +101,115 @@ class PageSelectionTests(unittest.IsolatedAsyncioTestCase):
         mgr = make_manager([FakeTab("https://demo18-scm.hoolinks.com/static/admin")])
         with self.assertRaises(RuntimeError):
             await mgr.switch_target("does-not-exist.example")
+
+
+class TestFillWatchdogTimeout(unittest.TestCase):
+    def test_short_input_uses_base(self):
+        """短输入: 看门狗超时 = 基础单步上限 (15s)。"""
+        self.assertEqual(_fill_watchdog_timeout("abc"), 15.0)
+
+    def test_long_input_scales_with_length(self):
+        """长文本逐字输入: 超时按字符数放宽, 不被看门狗误杀。"""
+        # 200 字符 @100ms/字 ≈ 20s 输入 + 6s 余量 → >15s 基础值
+        t = _fill_watchdog_timeout("x" * 200)
+        self.assertGreater(t, 15.0)
+        self.assertAlmostEqual(t, 200 * 0.12 + 6.0, places=6)
+
+    def test_empty_value_uses_base(self):
+        self.assertEqual(_fill_watchdog_timeout(""), 15.0)
+
+    def test_custom_base(self):
+        """基础值可配 (ACTION_STEP_TIMEOUT_MS 环境变量覆盖时)。"""
+        self.assertEqual(_fill_watchdog_timeout("x" * 10, base_ms=30000), 30.0)
+
+
+class TestLayerAwareDiagnosis(unittest.IsolatedAsyncioTestCase):
+    """弹层感知定位诊断: 区分选择器失效 / 隐藏弹层需激活 / 消息容器未挂载。"""
+
+    async def test_visible_wait_success_returns_locator(self):
+        from unittest.mock import AsyncMock
+
+        from qa_mcp.tools import browser
+
+        lc = AsyncMock()
+        lc.wait_for = AsyncMock(return_value=None)
+        out = await browser._wait_visible_or_first(lc, "点击", 3000)
+        self.assertIs(out, lc)
+        lc.wait_for.assert_awaited_once_with(state="visible", timeout=3000)
+
+    async def test_not_attached_falls_back_to_count_diagnosis(self):
+        from unittest.mock import AsyncMock
+
+        from qa_mcp.tools import browser
+
+        lc = AsyncMock()
+        lc.wait_for = AsyncMock(side_effect=TimeoutError("timeout: waiting for #btn"))
+        lc.first = AsyncMock()
+        lc.first.wait_for = AsyncMock(side_effect=TimeoutError("not attached"))
+        lc.count = AsyncMock(return_value=0)
+        with self.assertRaisesRegex(RuntimeError, "匹配 0 个元素"):
+            await browser._wait_visible_or_first(lc, "点击", 3000)
+
+    async def test_hidden_layer_reports_container(self):
+        """元素已挂载但不可见: 报告最近弹层容器 (hidden/display:none), 提示先激活。"""
+        from unittest.mock import AsyncMock
+
+        from qa_mcp.tools import browser
+
+        lc = AsyncMock()
+        lc.wait_for = AsyncMock(side_effect=TimeoutError("timeout: waiting for #sel"))
+        lc.first = AsyncMock()
+        lc.first.wait_for = AsyncMock(return_value=None)
+        lc.first.evaluate = AsyncMock(
+            return_value={
+                "containerClass": "ant-select-dropdown",
+                "role": "listbox",
+                "hidden": True,
+                "display": "none",
+                "visibility": "hidden",
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "ant-select-dropdown") as ctx:
+            await browser._wait_visible_or_first(lc, "选择", 3000)
+        self.assertIn("先点击触发器激活", str(ctx.exception))
+
+    async def test_message_container_not_mounted(self):
+        """消息容器 (message-content): 提示内容可能未挂载完成或已消失。"""
+        from unittest.mock import AsyncMock
+
+        from qa_mcp.tools import browser
+
+        lc = AsyncMock()
+        lc.wait_for = AsyncMock(side_effect=TimeoutError("timeout"))
+        lc.first = AsyncMock()
+        lc.first.wait_for = AsyncMock(return_value=None)
+        lc.first.evaluate = AsyncMock(
+            return_value={
+                "containerClass": "message-content",
+                "role": "",
+                "hidden": False,
+                "display": "block",
+                "visibility": "visible",
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "message-content") as ctx:
+            await browser._wait_visible_or_first(lc, "读取消息", 3000)
+        self.assertIn("未挂载完成或已消失", str(ctx.exception))
+
+    async def test_evaluate_failure_falls_back_to_count(self):
+        """探针 evaluate 失败 (strict 等) → 回退 count 诊断。"""
+        from unittest.mock import AsyncMock
+
+        from qa_mcp.tools import browser
+
+        lc = AsyncMock()
+        lc.wait_for = AsyncMock(side_effect=TimeoutError("timeout"))
+        lc.first = AsyncMock()
+        lc.first.wait_for = AsyncMock(return_value=None)
+        lc.first.evaluate = AsyncMock(side_effect=RuntimeError("strict mode violation"))
+        lc.count = AsyncMock(return_value=2)
+        with self.assertRaisesRegex(RuntimeError, "匹配 2 个元素"):
+            await browser._wait_visible_or_first(lc, "点击", 3000)
 
 
 if __name__ == "__main__":

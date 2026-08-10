@@ -16,6 +16,7 @@ from qa_mcp.config import (
     PROJECT_DIR,
     ELEMENT_WAIT_TIMEOUT_MS,
     OBSERVE_WAIT_MS,
+    ACTION_STEP_TIMEOUT_MS,
     ACTION_RETRY_ATTEMPTS,
     ACTION_RETRY_BACKOFF_MS,
     CONNECT_RETRY_ATTEMPTS,
@@ -800,17 +801,58 @@ async def _enhance_locator_timeout(e: Exception, locator, label: str) -> Excepti
     return error
 
 
+# 弹层容器探针: 从目标元素向上找最近的 Portal 弹层特征容器
+# (antd/element/VTable 弹层 / role=dialog|listbox|menu|alert|status),
+# 返回容器 class/role/hidden/display 状态 —— 帮助区分"选择器失效" vs
+# "元素在隐藏弹层内需先激活" vs "消息容器 (message-content) 未挂载/已消失"。
+LAYER_PROBE_JS = r"""(el) => {
+    const LAYER_CLASS = /(modal|dialog|drawer|popover|popper|dropdown|select-dropdown|message|toast|tooltip|calendar|picker|menu|overlay)/i;
+    let cur = el;
+    while (cur && cur.nodeType === Node.ELEMENT_NODE) {
+        const cls = typeof cur.className === 'string' ? cur.className : (cur.getAttribute('class') || '');
+        const role = cur.getAttribute('role') || '';
+        if (LAYER_CLASS.test(cls) || /dialog|listbox|menu|alert|status/.test(role)) {
+            const style = getComputedStyle(cur);
+            const rect = cur.getBoundingClientRect();
+            return {
+                containerClass: cls.slice(0, 120),
+                role: role,
+                hidden: cur.hidden || cur.getAttribute('aria-hidden') === 'true' || /hidden/i.test(cls) || style.display === 'none' || style.visibility === 'hidden',
+                display: style.display,
+                visibility: style.visibility,
+                hasSize: rect.width > 0 && rect.height > 0
+            };
+        }
+        cur = cur.parentElement;
+    }
+    return null;
+}"""
+
+
+async def _describe_hidden_layer(lc) -> Optional[dict]:
+    """探测目标元素所在的最近弹层容器状态 (定位失败诊断用)。"""
+    try:
+        return await lc.first.evaluate(LAYER_PROBE_JS)
+    except Exception:
+        return None
+
+
 async def _wait_visible_or_first(
     lc, action_label: str, timeout_ms: int
 ):
-    """可见性等待 + strict violation 消歧。
-    多元素匹配 (典型: 日历双面板同名 td[title=...]、antd 常驻 dropdown 残余层)
-    时 wait_for 抛 strict mode violation, 直接失败挂死重试。此时自动取 .first
-    (DOM 顺序靠前的匹配, 如日历左面板优先于右面板预览) 消歧重试。
-    非 strict 错误原样抛出 (由调用方增强诊断/重试)。
+    """可见性等待 + 弹层感知定位诊断。
+
+    strict mode violation (多元素匹配) 是官方保护机制, 不自动消歧——
+    原样透出错误, 由模型改用 nth / 更精确选择器。
+
+    可见性等待失败时区分三类 (供模型决策):
+    - 元素不存在 (attached 也失败) → 原诊断 (选择器匹配数)
+    - 元素已挂载但不可见 → 探测最近弹层容器 (hidden class/display:none/
+      message-content 动态挂载), 提示"需先点击触发器激活"或"消息未挂载/已消失"
     """
     try:
         await lc.wait_for(state="visible", timeout=timeout_ms)
+        return lc
     except Exception as e:
         if "strict mode violation" in str(e).lower():
             logger.warning(
@@ -819,7 +861,24 @@ async def _wait_visible_or_first(
             lc = lc.first
             await lc.wait_for(state="visible", timeout=timeout_ms)
             return lc
-        raise
+        # 弹层感知诊断: attached 检测区分"元素不存在"vs"已挂载但不可见"
+        # (隐藏弹层容器内 / 消息容器未挂载), 供调用方祖先回退失败后给出精确错误。
+        try:
+            await lc.first.wait_for(state="attached", timeout=2000)
+        except Exception:
+            raise await _enhance_locator_timeout(e, lc, action_label) from e
+        layer = await _describe_hidden_layer(lc)
+        if layer:
+            raise RuntimeError(
+                f"{action_label} 定位超时: 元素已挂载但不可见, 最近弹层容器 "
+                f"{layer.get('containerClass') or '?'!r} (role={layer.get('role') or '-'}, "
+                f"hidden={layer.get('hidden')}, display={layer.get('display')}, "
+                f"visibility={layer.get('visibility')}). "
+                "若为隐藏下拉/弹层: 需先点击触发器激活后再定位; "
+                "若为消息容器 (message-content): 内容可能未挂载完成或已消失, "
+                "需在消息出现后立即定位。"
+            ) from e
+        raise await _enhance_locator_timeout(e, lc, action_label) from e
     return lc
 async def _visible_ancestor_path(target, lc) -> Optional[str]:
     """目标元素存在但不可见时, 返回最近可见祖先的 CSS 路径 (nth-child 链)。
@@ -971,12 +1030,11 @@ async def _do_click(
     viz_result = None
     frame_path_list: List[str] = []
     clicked_ancestor: Optional[str] = None
-    if not viz:
-        viz_result = await _visual_show(page, (), (), "", "", enabled=False)
 
     async def _dom_click_once():
         # 每次执行/重试重新解析目标与 locator: 覆盖 SPA 重渲染 detach、
         # iframe 重新导航等导致旧 locator 失效的场景。
+        # 视觉 disable/show 由外层 _exec_click 统一处理, 这里不重复调用。
         nonlocal frame_path_list, viz_result, clicked_ancestor
         clicked_ancestor = None
         target, frame_path_list = await _resolve_frame_target(page, iframe_selector)
@@ -1019,35 +1077,40 @@ async def _do_click(
                 action="click",
                 enabled=True,
             )
-        # 点击执行: 常规 actionability (含 stable) 等待; 持续动画页面 stable 检查
-        # 会挂到默认 30s, 故先给短超时, 超时后 force 兜底 (跳过 actionability 直接派发事件)。
+        # 点击执行: 官方 actionability 智能等待 (visible/stable/receives events),
+        # 官方会在超时窗口内自动重试; 持续动画页面的 stable 等待可能较长,
+        # 故给显式超时, 超时抛错由上层看门狗兜底 (不做 force 绕过官方检查)。
         click_timeout = max(ELEMENT_WAIT_TIMEOUT_MS, 5000)
-        try:
-            if click_kind == "double":
-                await lc.dblclick(timeout=click_timeout)
-            else:
-                await lc.click(timeout=click_timeout)
-        except Exception as e:
-            if _is_actionability_failure(e):
-                logger.warning(
-                    f"[{action_label}] actionability 检查未通过 (持续动画/遮挡/不在视口), "
-                    f"force 点击兜底: {e}"
-                )
-                if click_kind == "double":
-                    await lc.dblclick(force=True)
-                else:
-                    await lc.click(force=True)
-            else:
-                raise
+        if click_kind == "double":
+            await lc.dblclick(timeout=click_timeout)
+        else:
+            await lc.click(timeout=click_timeout)
         return box
 
+    async def _exec_click() -> tuple:
+        # 单次完整点击动作 (视觉 + 定位重试), 供外层看门狗限时
+        nonlocal viz_result
+        if not viz:
+            viz_result = await _visual_show(page, (), (), "", "", enabled=False)
+        try:
+            box = await retry_ui_action(action_label, _dom_click_once)
+        except Exception:
+            if viz:
+                viz_result = await _visual_finish(page, False, True, viz_result)
+            raise
+        return box, await _visual_finish(page, True, viz, viz_result)
     try:
-        box = await retry_ui_action(action_label, _dom_click_once)
-    except Exception:
-        if viz:
-            viz_result = await _visual_finish(page, False, True, viz_result)
-        raise
-    viz_result = await _visual_finish(page, True, viz, viz_result)
+        # 单步硬上限: CDP 挂死/连接半开时 Playwright 动作级 timeout 不生效,
+        # 协议调用无限等待, 用外层 wait_for 兜底 (官方盲区)。
+        box, viz_result = await asyncio.wait_for(
+            _exec_click(), timeout=ACTION_STEP_TIMEOUT_MS / 1000
+        )
+    except asyncio.TimeoutError:
+        await _recover_after_hang(f"点击 [{action_label}]")
+        raise RuntimeError(
+            f"点击动作 [{action_label}] 执行超过 {ACTION_STEP_TIMEOUT_MS}ms 上限, "
+            "已强制中断并重建 CDP 连接。请检查浏览器/页面状态后重试。"
+        ) from None
 
     return {
         "status": "success",
@@ -1061,6 +1124,16 @@ async def _do_click(
         "description": description,
         "visual_effects": viz_result,
     }
+
+
+def _fill_watchdog_timeout(value: str, base_ms: int = ACTION_STEP_TIMEOUT_MS) -> float:
+    """输入类动作的单步看门狗超时 (秒)。
+
+    逐字输入 100ms/字 (press_sequentially delay=100), 长文本 (如长备注/粘贴
+    大段内容) 在静态 base 内输不完会被看门狗误杀并重建连接——按字符数动态
+    放宽: 每字预留 120ms + 定位/聚焦/清空 6s 余量, 且不低于 base。
+    """
+    return max(base_ms / 1000, len(value or "") * 0.12 + 6.0)
 
 
 async def _do_fill(
@@ -1087,11 +1160,10 @@ async def _do_fill(
     action_label = description or (f"输入: {value}" if value else "清空输入框") or selector or "input"
     viz_result = None
     frame_path_list: List[str] = []
-    if not viz:
-        viz_result = await _visual_show(page, (), (), "", "", enabled=False)
 
     async def _dom_fill_once():
         # 每次执行/重试重新解析目标与 locator (同 _do_click 的重试语义)
+        # 视觉 disable/show 由外层 _exec_fill 统一处理, 这里不重复调用。
         nonlocal frame_path_list, viz_result
         target, frame_path_list = await _resolve_frame_target(page, iframe_selector)
         lc = target.locator(full_selector)
@@ -1119,17 +1191,8 @@ async def _do_fill(
                 enabled=True,
             )
         # 先点击聚焦 (对齐人工操作: 触发组件的 focus/激活逻辑);
-        # actionability 检查失败 (持续动画/遮挡等) → force 聚焦兜底。
-        try:
-            await lc.click(timeout=max(ELEMENT_WAIT_TIMEOUT_MS, 5000))
-        except Exception as e:
-            if _is_actionability_failure(e):
-                logger.warning(
-                    f"[{action_label}] actionability 检查未通过, force 点击聚焦兜底: {e}"
-                )
-                await lc.click(force=True)
-            else:
-                raise
+        # 官方 actionability 智能等待, 超时抛错由上层看门狗兜底。
+        await lc.click(timeout=max(ELEMENT_WAIT_TIMEOUT_MS, 5000))
         if method == "fill":
             await lc.fill(value or "")
         else:
@@ -1148,13 +1211,32 @@ async def _do_fill(
             await lc.press("Enter")
         return box
 
+    async def _exec_fill() -> tuple:
+        # 单次完整输入动作 (视觉 + 定位重试), 供外层看门狗限时
+        nonlocal viz_result
+        if not viz:
+            viz_result = await _visual_show(page, (), (), "", "", enabled=False)
+        try:
+            box = await retry_ui_action(action_label, _dom_fill_once)
+        except Exception:
+            if viz:
+                viz_result = await _visual_finish(page, False, True, viz_result)
+            raise
+        return box, await _visual_finish(page, True, viz, viz_result)
+
     try:
-        box = await retry_ui_action(action_label, _dom_fill_once)
-    except Exception:
-        if viz:
-            viz_result = await _visual_finish(page, False, True, viz_result)
-        raise
-    viz_result = await _visual_finish(page, True, viz, viz_result)
+        # 单步硬上限: CDP 挂死时 Playwright 动作级 timeout 不生效, 用外层
+        # wait_for 兜底 (对齐 action_chain 的 ACTION_STEP_TIMEOUT_MS 语义);
+        # 长文本逐字输入按字符数动态放宽, 避免误杀 (见 _fill_watchdog_timeout)。
+        box, viz_result = await asyncio.wait_for(
+            _exec_fill(), timeout=_fill_watchdog_timeout(value)
+        )
+    except asyncio.TimeoutError:
+        await _recover_after_hang(f"输入 [{action_label}]")
+        raise RuntimeError(
+            f"输入动作 [{action_label}] 执行超过 {ACTION_STEP_TIMEOUT_MS}ms 上限, "
+            "已强制中断并重建 CDP 连接。请检查浏览器/页面状态后重试。"
+        ) from None
 
     return {
         "status": "success",
@@ -1263,10 +1345,10 @@ async def _do_hover(
     action_label = description or full_selector or "悬停"
     viz_result = None
     frame_path_list: List[str] = []
-    if not viz:
-        viz_result = await _visual_show(page, (), (), "", "", enabled=False)
+
     async def _dom_hover_once():
         # 每次执行/重试重新解析目标与 locator (同 _do_click 的重试语义)
+        # 视觉 disable/show 由外层 _exec_hover 统一处理, 这里不重复调用。
         nonlocal frame_path_list, viz_result
         target, frame_path_list = await _resolve_frame_target(page, iframe_selector)
         if locator_kind == "role":
@@ -1294,28 +1376,37 @@ async def _do_hover(
                 action="hover",
                 enabled=True,
             )
-        # actionability 检查失败 (持续动画/遮挡等) → force 悬停兜底 (直接移动鼠标, 跳过检查)。
-        try:
-            await lc.hover(timeout=max(ELEMENT_WAIT_TIMEOUT_MS, 5000))
-        except Exception as e:
-            if _is_actionability_failure(e):
-                logger.warning(
-                    f"[{action_label}] actionability 检查未通过, force 悬停兜底: {e}"
-                )
-                await lc.hover(force=True)
-            else:
-                raise
+        # 官方 actionability 智能等待, 超时抛错由上层看门狗兜底。
+        await lc.hover(timeout=max(ELEMENT_WAIT_TIMEOUT_MS, 5000))
         # 停留让 CSS :hover 派生元素 (clear 图标/tooltip) 渲染完成
         if hold_ms and hold_ms > 0:
             await asyncio.sleep(hold_ms / 1000)
         return box
+
+    async def _exec_hover() -> tuple:
+        # 单次完整悬停动作 (视觉 + 定位重试), 供外层看门狗限时
+        nonlocal viz_result
+        if not viz:
+            viz_result = await _visual_show(page, (), (), "", "", enabled=False)
+        try:
+            box = await retry_ui_action(action_label, _dom_hover_once)
+        except Exception:
+            if viz:
+                viz_result = await _visual_finish(page, False, True, viz_result)
+            raise
+        return box, await _visual_finish(page, True, viz, viz_result)
     try:
-        box = await retry_ui_action(action_label, _dom_hover_once)
-    except Exception:
-        if viz:
-            viz_result = await _visual_finish(page, False, True, viz_result)
-        raise
-    viz_result = await _visual_finish(page, True, viz, viz_result)
+        # 单步硬上限: CDP 挂死/连接半开时 Playwright 动作级 timeout 不生效,
+        # 协议调用无限等待, 用外层 wait_for 兜底 (官方盲区)。
+        box, viz_result = await asyncio.wait_for(
+            _exec_hover(), timeout=ACTION_STEP_TIMEOUT_MS / 1000
+        )
+    except asyncio.TimeoutError:
+        await _recover_after_hang(f"悬停 [{action_label}]")
+        raise RuntimeError(
+            f"悬停动作 [{action_label}] 执行超过 {ACTION_STEP_TIMEOUT_MS}ms 上限, "
+            "已强制中断并重建 CDP 连接。请检查浏览器/页面状态后重试。"
+        ) from None
     # 悬停态元素扫描: 目标元素内由隐藏转可见的子元素 (clear 图标/tooltip),
     # 返回顶层视口坐标与相对路径, 供下一步直接点击。
     revealed = []

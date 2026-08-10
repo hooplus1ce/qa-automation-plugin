@@ -66,13 +66,26 @@ DYNAMIC_LAYER_SCAN_SCRIPT = r"""(detail) => {
 
     function hasHiddenMarker(element) {
         const cls = classText(element);
-        // antd/el 收起动画残影 (slide-up-leave / slide-up-leave-active / leave-done):
-        // 动画结束前元素仍 :visible, 会被误判为"还开着的下拉/弹层",
-        // 造成观察结果噪音 (Agent 误以为浮层未关闭)。
+        // antd 收起动画残影 (slide-up-leave 等): 动画结束前元素仍 :visible 且带
+        // leave 类, 会被误判为"还开着的下拉/弹层"。但**显示中的 antd 消息**
+        // (ant-message-notice) 也可能带 move-up-leave 类 (本项目 WMS 实测:
+        // 警告提示"请选择采购订单!"显示期间即携带 leave 动画类)——仅当
+        // "无文本内容且无交互元素" (纯收起残影骨架) 时才判隐藏; 有内容的
+        // 显示中消息必须保留, 否则校验提示等消息探查不到。
+        const leaving = /-leave\b|leave-active\b|leave-done\b/.test(cls);
+        if (leaving) {
+            const text = cleanText(element.innerText || element.textContent || '');
+            const hasInteractive = Boolean(
+                element.querySelector &&
+                element.querySelector(
+                    'button, input, select, textarea, a, [role], [tabindex]:not([tabindex="-1"])'
+                )
+            );
+            if (!text && !hasInteractive) return true;
+        }
         return element.hidden ||
             element.getAttribute('aria-hidden') === 'true' ||
-            /hidden/i.test(cls) ||
-            /-leave\b|leave-active\b|leave-done\b/.test(cls);
+            /hidden/i.test(cls);
     }
 
     function isVisible(element) {
