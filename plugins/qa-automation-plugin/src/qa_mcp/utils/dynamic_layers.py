@@ -1,3 +1,4 @@
+import asyncio
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -295,15 +296,29 @@ async def scan_dynamic_layers(
     first_keys: Optional[set[str]] = None
     last_new_keys: Optional[set[str]] = None
     new_seen_at: Optional[float] = None
+    # 单帧 evaluate 挂死 (3s 超时) 的 frame: 后续轮询跳过, 不让一个坏 frame
+    # 在每轮轮询各拖 3s, 把整个观察窗口无限拉长
+    dead_frames: set[int] = set()
 
     while True:
         for frame in page.frames:
+            if id(frame) in dead_frames:
+                continue
             try:
-                frame_path = await frame_path_resolver(frame)
+                # frame_path_resolver / evaluate 均为无动作级超时的 CDP 调用,
+                # 渲染繁忙/主线程假死时可能无限等待, 逐帧加 3s 上限兜底。
+                frame_path = await asyncio.wait_for(
+                    frame_path_resolver(frame), timeout=3
+                )
                 if selectors and frame_path != selectors:
                     continue
                 scanned_frames.add("->".join(frame_path))
-                snapshot = await frame.evaluate(DYNAMIC_LAYER_SCAN_SCRIPT, detail)
+                snapshot = await asyncio.wait_for(
+                    frame.evaluate(DYNAMIC_LAYER_SCAN_SCRIPT, detail), timeout=3
+                )
+            except asyncio.TimeoutError:
+                dead_frames.add(id(frame))
+                continue
             except Exception:
                 continue
 

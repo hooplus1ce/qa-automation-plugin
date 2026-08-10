@@ -38,6 +38,7 @@ class TestWatchdogTimeout(unittest.TestCase):
                 server, "browser_mgr"
             ) as bm:
                 bm.close = AsyncMock()
+                bm.recover = AsyncMock()
                 r1 = await mw.on_call_tool(_ctx(), _hung_call_next)
                 self.assertIsInstance(r1, ToolResult)
                 self.assertTrue(r1.is_error)
@@ -47,7 +48,9 @@ class TestWatchdogTimeout(unittest.TestCase):
                 r2 = await mw.on_call_tool(_ctx(), _fast_call_next)
                 self.assertFalse(r2.is_error)
                 self.assertEqual(r2.content[0].text, "ok")
-                bm.close.assert_awaited()
+                # 看门狗重置走 recover() (有界 stop + 重建连接) 而非 close()
+                # (无界 stop 会在半开连接上挂死并堵死后续调用)
+                bm.recover.assert_awaited()
 
         asyncio.run(scenario())
 

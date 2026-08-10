@@ -103,9 +103,15 @@ class ToolSerializationMiddleware(Middleware):
 
 
 async def _safe_close_browser() -> None:
-    """看门狗超时后的连接重置 (异常只记录, 不阻塞响应)。"""
+    """看门狗超时后的连接重置 (异常只记录, 不阻塞响应)。
+
+    用 recover() 而非 close(): recover 内部对半开连接的 stop() 有 5s 上限,
+    并立即重建全新 CDP 连接; close() 的 stop() 无超时保护, 半开连接上会永久
+    挂住并持有 browser_mgr._lock, 把后续所有工具调用堵死在 get_page 队列里
+    (现象: 一次卡死动作后, 后续所有调用全部"不执行")。
+    """
     try:
-        await browser_mgr.close()
+        await asyncio.wait_for(browser_mgr.recover(), timeout=10)
     except Exception:
         logger.exception("看门狗重置浏览器连接失败 (忽略)")
 

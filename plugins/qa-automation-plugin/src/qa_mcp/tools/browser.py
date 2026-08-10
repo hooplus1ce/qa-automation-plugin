@@ -14,6 +14,7 @@ from qa_mcp.config import (
     PROJECT_DIR,
     ELEMENT_WAIT_TIMEOUT_MS,
     OBSERVE_WAIT_MS,
+    ACTION_STEP_TIMEOUT_MS,
     ACTION_RETRY_ATTEMPTS,
     ACTION_RETRY_BACKOFF_MS,
     CONNECT_RETRY_ATTEMPTS,
@@ -110,8 +111,10 @@ class BrowserManager:
     async def _is_visible(self, page: Page) -> bool:
         """探测标签页是否为浏览器当前激活页 (窗口前台时可见)。探测失败按不可见处理。"""
         try:
-            return bool(await page.evaluate("() => document.visibilityState === 'visible'"))
-        except Exception:
+            return bool(await asyncio.wait_for(
+                page.evaluate("() => document.visibilityState === 'visible'"), timeout=3
+            ))
+        except (asyncio.TimeoutError, Exception):
             return False
 
     def reset_target(self) -> None:
@@ -151,13 +154,21 @@ class BrowserManager:
                 return await self._select_page()
 
     async def _close_unlocked(self) -> None:
-        """释放连接与全部字段 (调用方必须持有 _lock)。"""
-        if self._playwright:
-            await self._playwright.stop()
+        """释放连接与全部字段 (调用方必须持有 _lock)。
+
+        先复位字段、再停连接: 半开连接上 stop() 可能无限等待, 外部 wait_for
+        强杀后字段已复位, 下次 get_page 走全新连接而非残留半死对象。
+        """
+        pw = self._playwright
         self._playwright = None
         self._browser = None
         self._context = None
         self._target_page = None
+        if pw:
+            try:
+                await asyncio.wait_for(pw.stop(), timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
     async def recover(self, preferred_url: Optional[str] = None) -> Page:
         """重建 CDP 连接 (动作被 wait_for 强杀后的自愈入口)。
@@ -170,16 +181,18 @@ class BrowserManager:
         preferred_url: 重建后优先按 URL 子串恢复目标页锁定; 无匹配则走默认选择规则。
         """
         async with self._lock:
-            # 旧连接可能半开, stop 时不要无限等待协议响应
-            if self._playwright:
-                try:
-                    await asyncio.wait_for(self._playwright.stop(), timeout=5)
-                except (asyncio.TimeoutError, Exception):
-                    pass
+            # 先复位字段再停连接 (同 _close_unlocked 语义): 旧连接可能半开,
+            # stop() 无限等待被外部强杀后字段已复位, 下次 get_page 走全新连接。
+            pw = self._playwright
             self._playwright = None
             self._browser = None
             self._context = None
             self._target_page = None
+            if pw:
+                try:
+                    await asyncio.wait_for(pw.stop(), timeout=5)
+                except (asyncio.TimeoutError, Exception):
+                    pass
 
             self._playwright = await async_playwright().start()
             await self._connect()
@@ -414,19 +427,26 @@ async def probe_dynamic_layers_impl(
 #   4. iframe 跳转: iframe 清单 (id/src/可见性) 前后对比 (navigation.frames_changed)
 
 async def scan_frames(page) -> List[Dict[str, Any]]:
-    """扫描顶层文档中所有 iframe 的 id/src/可见性, 用于点击前后对比是否发生 iframe 跳转。"""
-    return await page.evaluate("""() => {
-        const out = [];
-        document.querySelectorAll('iframe').forEach(f => {
-            const r = f.getBoundingClientRect();
-            out.push({
-                id: f.id || '',
-                src: f.src || '',
-                visible: !!(f.offsetWidth || f.offsetHeight || r.width)
+    """扫描顶层文档中所有 iframe 的 id/src/可见性, 用于点击前后对比是否发生 iframe 跳转。
+
+    主线程假死/渲染繁忙时 evaluate 可能无限等待协议响应, 3s 超时后按空清单
+    尽力而为 (前后对比降级为全量上报, 不阻塞点击流程)。
+    """
+    try:
+        return await asyncio.wait_for(page.evaluate("""() => {
+            const out = [];
+            document.querySelectorAll('iframe').forEach(f => {
+                const r = f.getBoundingClientRect();
+                out.push({
+                    id: f.id || '',
+                    src: f.src || '',
+                    visible: !!(f.offsetWidth || f.offsetHeight || r.width)
+                });
             });
-        });
-        return out;
-    }""")
+            return out;
+        }"""), timeout=3)
+    except (asyncio.TimeoutError, Exception):
+        return []
 
 
 async def popup_fingerprint(page) -> Dict[str, Dict[str, Any]]:
@@ -519,9 +539,11 @@ async def _scan_focus_modals(page) -> List[Dict[str, Any]]:
     modals = []
     for frame in page.frames:
         try:
-            frame_path = await get_frame_path(frame)
-            found = await frame.evaluate(FOCUS_MODAL_SCAN_SCRIPT)
-        except Exception:
+            frame_path = await asyncio.wait_for(get_frame_path(frame), timeout=3)
+            found = await asyncio.wait_for(
+                frame.evaluate(FOCUS_MODAL_SCAN_SCRIPT), timeout=3
+            )
+        except (asyncio.TimeoutError, Exception):
             continue
         for m in found:
             m["frame_path"] = frame_path
@@ -593,16 +615,19 @@ async def observe_after_click(
                         break
                 if frame is not None:
                     try:
-                        inside = await frame.evaluate(
-                            """(sels) => {
-                                const el = sels.map(s => { try { return document.querySelector(s); } catch (e) { return null; } })
-                                    .find(e => e);
-                                if (!el) return null;
-                                return Boolean(el.closest('.ant-modal-wrap, .ant-modal, .ant-drawer'));
-                            }""",
-                            sels,
+                        inside = await asyncio.wait_for(
+                            frame.evaluate(
+                                """(sels) => {
+                                    const el = sels.map(s => { try { return document.querySelector(s); } catch (e) { return null; } })
+                                        .find(e => e);
+                                    if (!el) return null;
+                                    return Boolean(el.closest('.ant-modal-wrap, .ant-modal, .ant-drawer'));
+                                }""",
+                                sels,
+                            ),
+                            timeout=3,
                         )
-                    except Exception:
+                    except (asyncio.TimeoutError, Exception):
                         inside = False
             if not inside:
                 layer["text"] = (layer.get("text") or "")[:40]
@@ -798,6 +823,20 @@ async def retry_ui_action(
     raise last_exc
 
 
+async def _recover_after_hang(context: str) -> None:
+    """动作被看门狗强杀后的 CDP 连接重建 (对齐 action_chain 的自愈语义)。
+
+    强杀一个 CDP 请求半开的协程后, Playwright 底层可能残留 pending 协议请求,
+    后续所有工具调用会排队挂死 (典型症状: 同一定位单独调用成功、紧随失败动作
+    后调用却超时)。重建连接是最干净的恢复方式, 等价于 MCP 服务重启。
+    """
+    try:
+        await asyncio.wait_for(browser_mgr.recover(), timeout=10)
+        logger.warning(f"{context} 已重建 CDP 连接")
+    except Exception as exc:
+        logger.warning(f"{context} 连接重建失败: {exc}")
+
+
 async def _enhance_locator_timeout(e: Exception, locator, label: str) -> Exception:
     """定位超时错误附加诊断: selector 当前在页面匹配的元素数。
 
@@ -908,12 +947,24 @@ async def _do_click(
                 enabled=True,
             )
         try:
-            result = await vtable_mgr.click_at(
-                x=x, y=y,
-                iframe_selector=iframe_selector if iframe_selector is not None else "div[aria-hidden=false] iframe",
-                coordinate_space=coordinate_space,
-                click_type=click_kind,
+            # 单步硬上限: CDP 挂死时 Playwright 动作级 timeout 不生效,
+            # 用外层 wait_for 兜底, 防止一个死动作把整个工具调用堵死
+            # (对齐 action_chain 的 ACTION_STEP_TIMEOUT_MS 语义)。
+            result = await asyncio.wait_for(
+                vtable_mgr.click_at(
+                    x=x, y=y,
+                    iframe_selector=iframe_selector if iframe_selector is not None else "div[aria-hidden=false] iframe",
+                    coordinate_space=coordinate_space,
+                    click_type=click_kind,
+                ),
+                timeout=ACTION_STEP_TIMEOUT_MS / 1000,
             )
+        except asyncio.TimeoutError:
+            await _recover_after_hang(f"坐标点击 ({x:.0f},{y:.0f})")
+            raise RuntimeError(
+                f"坐标点击 ({x:.0f},{y:.0f}) 执行超过 {ACTION_STEP_TIMEOUT_MS}ms 上限, "
+                "已强制中断并重建 CDP 连接。请检查浏览器/页面状态后重试。"
+            ) from None
         except Exception:
             if viz:
                 viz_result = await _visual_finish(page, False, True, viz_result)
@@ -938,8 +989,6 @@ async def _do_click(
     action_label = description or full_selector or "点击"
     viz_result = None
     frame_path_list: List[str] = []
-    if not viz:
-        viz_result = await _visual_show(page, (), (), "", "", enabled=False)
 
     async def _dom_click_once():
         # 每次执行/重试重新解析目标与 locator: 覆盖 SPA 重渲染 detach、
@@ -1003,13 +1052,31 @@ async def _do_click(
                 raise
         return box
 
+    async def _exec_click() -> tuple:
+        # 单次完整点击动作 (视觉 + 定位重试 + force 兜底), 供外层看门狗限时
+        nonlocal viz_result
+        if not viz:
+            viz_result = await _visual_show(page, (), (), "", "", enabled=False)
+        try:
+            box = await retry_ui_action(action_label, _dom_click_once)
+        except Exception:
+            if viz:
+                viz_result = await _visual_finish(page, False, True, viz_result)
+            raise
+        return box, await _visual_finish(page, True, viz, viz_result)
+
     try:
-        box = await retry_ui_action(action_label, _dom_click_once)
-    except Exception:
-        if viz:
-            viz_result = await _visual_finish(page, False, True, viz_result)
-        raise
-    viz_result = await _visual_finish(page, True, viz, viz_result)
+        # 单步硬上限: CDP 挂死时 Playwright 动作级 timeout 不生效, 用外层
+        # wait_for 兜底 (对齐 action_chain 的 ACTION_STEP_TIMEOUT_MS 语义)。
+        box, viz_result = await asyncio.wait_for(
+            _exec_click(), timeout=ACTION_STEP_TIMEOUT_MS / 1000
+        )
+    except asyncio.TimeoutError:
+        await _recover_after_hang(f"点击 [{action_label}]")
+        raise RuntimeError(
+            f"点击动作 [{action_label}] 执行超过 {ACTION_STEP_TIMEOUT_MS}ms 上限, "
+            "已强制中断并重建 CDP 连接。请检查浏览器/页面状态后重试。"
+        ) from None
 
     return {
         "status": "success",
@@ -1048,8 +1115,6 @@ async def _do_fill(
     action_label = description or (f"输入: {value}" if value else "清空输入框") or selector or "input"
     viz_result = None
     frame_path_list: List[str] = []
-    if not viz:
-        viz_result = await _visual_show(page, (), (), "", "", enabled=False)
 
     async def _dom_fill_once():
         # 每次执行/重试重新解析目标与 locator (同 _do_click 的重试语义)
@@ -1108,13 +1173,31 @@ async def _do_fill(
             await lc.press("Enter")
         return box
 
+    async def _exec_fill() -> tuple:
+        # 单次完整输入动作 (视觉 + 定位重试 + 聚焦兜底), 供外层看门狗限时
+        nonlocal viz_result
+        if not viz:
+            viz_result = await _visual_show(page, (), (), "", "", enabled=False)
+        try:
+            box = await retry_ui_action(action_label, _dom_fill_once)
+        except Exception:
+            if viz:
+                viz_result = await _visual_finish(page, False, True, viz_result)
+            raise
+        return box, await _visual_finish(page, True, viz, viz_result)
+
     try:
-        box = await retry_ui_action(action_label, _dom_fill_once)
-    except Exception:
-        if viz:
-            viz_result = await _visual_finish(page, False, True, viz_result)
-        raise
-    viz_result = await _visual_finish(page, True, viz, viz_result)
+        # 单步硬上限: CDP 挂死时 Playwright 动作级 timeout 不生效, 用外层
+        # wait_for 兜底 (对齐 action_chain 的 ACTION_STEP_TIMEOUT_MS 语义)。
+        box, viz_result = await asyncio.wait_for(
+            _exec_fill(), timeout=ACTION_STEP_TIMEOUT_MS / 1000
+        )
+    except asyncio.TimeoutError:
+        await _recover_after_hang(f"输入 [{action_label}]")
+        raise RuntimeError(
+            f"输入动作 [{action_label}] 执行超过 {ACTION_STEP_TIMEOUT_MS}ms 上限, "
+            "已强制中断并重建 CDP 连接。请检查浏览器/页面状态后重试。"
+        ) from None
 
     return {
         "status": "success",
@@ -1190,7 +1273,8 @@ async def _scan_hover_revealed(page, lc, iframe_selector: Optional[str]) -> List
     """
     try:
         target, _ = await _resolve_frame_target(page, iframe_selector)
-        return await lc.evaluate(HOVER_REVEAL_SCAN_JS)
+        # evaluate 无动作级超时, 渲染繁忙时可能无限等待, 3s 上限兜底
+        return await asyncio.wait_for(lc.evaluate(HOVER_REVEAL_SCAN_JS), timeout=3)
     except Exception as e:
         logger.warning(f"悬停态元素扫描失败: {e}")
         return []
@@ -1231,8 +1315,6 @@ async def _do_hover(
     action_label = description or full_selector or "悬停"
     viz_result = None
     frame_path_list: List[str] = []
-    if not viz:
-        viz_result = await _visual_show(page, (), (), "", "", enabled=False)
 
     async def _dom_hover_once():
         # 每次执行/重试重新解析目标与 locator (同 _do_click 的重试语义)
@@ -1280,13 +1362,31 @@ async def _do_hover(
             await asyncio.sleep(hold_ms / 1000)
         return box
 
+    async def _exec_hover() -> tuple:
+        # 单次完整悬停动作 (视觉 + 定位重试 + force 兜底), 供外层看门狗限时
+        nonlocal viz_result
+        if not viz:
+            viz_result = await _visual_show(page, (), (), "", "", enabled=False)
+        try:
+            box = await retry_ui_action(action_label, _dom_hover_once)
+        except Exception:
+            if viz:
+                viz_result = await _visual_finish(page, False, True, viz_result)
+            raise
+        return box, await _visual_finish(page, True, viz, viz_result)
+
     try:
-        box = await retry_ui_action(action_label, _dom_hover_once)
-    except Exception:
-        if viz:
-            viz_result = await _visual_finish(page, False, True, viz_result)
-        raise
-    viz_result = await _visual_finish(page, True, viz, viz_result)
+        # 单步硬上限: CDP 挂死时 Playwright 动作级 timeout 不生效, 用外层
+        # wait_for 兜底 (对齐 action_chain 的 ACTION_STEP_TIMEOUT_MS 语义)。
+        box, viz_result = await asyncio.wait_for(
+            _exec_hover(), timeout=ACTION_STEP_TIMEOUT_MS / 1000
+        )
+    except asyncio.TimeoutError:
+        await _recover_after_hang(f"悬停 [{action_label}]")
+        raise RuntimeError(
+            f"悬停动作 [{action_label}] 执行超过 {ACTION_STEP_TIMEOUT_MS}ms 上限, "
+            "已强制中断并重建 CDP 连接。请检查浏览器/页面状态后重试。"
+        ) from None
 
     # 悬停态元素扫描: 目标元素内由隐藏转可见的子元素 (clear 图标/tooltip),
     # 返回顶层视口坐标与相对路径, 供下一步直接点击。
