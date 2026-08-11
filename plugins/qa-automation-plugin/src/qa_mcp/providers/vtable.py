@@ -106,7 +106,7 @@ class VTableAutomationProvider(Provider):
             Tool.from_function(
                 vtable_drag_column_impl,
                 name="vtable_drag_column",
-                description="真实鼠标拖拽：把 source 列拖到 target 列前方(before)/后方(after)。先点击源列头中部选中整列，再分步拖拽到落点列松开；不使用实例 API 改列位置。source/target 支持列索引或字段名/列标题。返回拖拽前后列顺序、验证结果；未开启列头拖拽（dragHeaderMode）或列级 dragHeader=false 时给出明确报错。",
+                description="真实鼠标拖拽：把 source 列拖到 target 列前方(before)/后方(after)。先点击源列头中部选中整列（表头未启用整列选中时自动兜底纵向框选整列），再分步拖拽到落点列松开；不使用实例 API 改列位置。source/target 支持列索引或字段名/列标题。返回拖拽前后列顺序、验证结果；未开启列头拖拽（dragHeaderMode）或列级 dragHeader=false 时给出明确报错。",
             ),
             Tool.from_function(
                 vtable_resize_column_impl,

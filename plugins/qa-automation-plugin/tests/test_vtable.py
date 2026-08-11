@@ -610,6 +610,10 @@ DRAG_GEOM = {
     "sourceIsFrozen": False,
     "dropIsFrozen": False,
     "sourceCanDragByDefine": False,
+    # 源列 body 最后一行几何 (框选兜底使用; rowCount=10 → 全局最后一行 9)
+    "lastBodyRowGlobal": 9,
+    "sourceLastBodyCenter": {"x": 450.0, "y": 1000.0},
+    "sourceLastBodyVisible": True,
 }
 
 AFTER_GEOM_AFTER = {
@@ -807,6 +811,80 @@ class VTableDragColumnTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(first_x, 425.0, places=2)
         self.assertAlmostEqual(first_y, 120.0, places=2)
         self.assertEqual(result["verification"]["ok"], True)
+
+    async def test_drag_falls_back_to_box_select_when_header_select_disabled(self):
+        """表头未启用整列选中 (headerSelectMode='cell'): 点击两轮失败 → 真实鼠标纵向框选整列兜底 → 拖拽成功"""
+        geom = dict(DRAG_GEOM, headerSelectMode="cell")
+        mgr, page = self._make_mgr([
+            RESOLVE_AFTER,       # 1. 解析源/目标列
+            geom,                # 2. 几何信息 (headerSelectMode='cell')
+            True,                # 3. 列级 dragHeader 校验
+            NO_ICONS,            # 4. 源列表头图标 (无图标 → 点击点=列头中心)
+            {"selected": False},  # 5. 点击列头后未整列选中 (cell 模式只选表头单元格)
+            {"selected": False},  # 6. 重试一轮仍失败
+            {"selected": True},   # 7. 框选(按下→拖到最后一行→松开)后整列选中
+            True,                # 8. 拖拽启动条件
+            AFTER_GEOM_AFTER,    # 9. 拖拽后列顺序
+        ])
+
+        result = await mgr.drag_column("B", "E", position="after")
+
+        # 两轮点击 (各 1 次, 无图标 → 单点击点)
+        self.assertEqual(page.mouse.click.await_count, 2)
+        # 框选 down/up 1 次 + 拖拽 down/up 1 次
+        self.assertEqual(page.mouse.down.await_count, 2)
+        self.assertEqual(page.mouse.up.await_count, 2)
+        # 框选: 初始定位 1 + 缓动 18 步 (|1000-120|/50+1≈18), 终点 = 源列 body 最后一行中心 (450,1000)
+        self.assertEqual(page.mouse.move.await_count, 1 + 18 + 1 + 14)
+        box_last_x, box_last_y = page.mouse.move.await_args_list[18].args
+        self.assertAlmostEqual(box_last_x, 450.0, places=2)
+        self.assertAlmostEqual(box_last_y, 1000.0, places=2)
+        # 拖拽落点不变
+        last_x, last_y = page.mouse.move.await_args.args
+        self.assertAlmostEqual(last_x, 550.0, places=2)
+        self.assertAlmostEqual(last_y, 120.0, places=2)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["verification"]["source_index_after"], 4)
+        self.assertTrue(result["verification"]["ok"])
+
+    async def test_box_select_scrolls_to_last_row_when_off_viewport(self):
+        """源列 body 最后一行不在视口 (虚拟滚动未渲染): 框选前先 scrollToRow 滚动再重采几何"""
+        geom = dict(
+            DRAG_GEOM,
+            headerSelectMode="cell",
+            sourceLastBodyCenter=None,
+            sourceLastBodyVisible=False,
+        )
+        geom2 = dict(
+            DRAG_GEOM,
+            headerSelectMode="cell",
+            sourceLastBodyCenter={"x": 450.0, "y": 2000.0},
+            sourceLastBodyVisible=True,
+        )
+        mgr, page = self._make_mgr([
+            RESOLVE_AFTER,
+            geom,
+            True,
+            NO_ICONS,
+            {"selected": False},
+            {"selected": False},
+            True,                # scrollToRow (滚动到最后一行, 仅视图滚动)
+            geom2,               # 滚动后重采几何 (最后一行已渲染)
+            {"selected": True},
+            True,
+            AFTER_GEOM_AFTER,
+        ])
+
+        result = await mgr.drag_column("B", "E", position="after")
+
+        self.assertEqual(page.mouse.down.await_count, 2)
+        # 框选: 初始定位 1 + 缓动 32 步 (|2000-120|/50+1=38, 上限 32), 终点 = 重采后的 (450,2000)
+        self.assertEqual(page.mouse.move.await_count, 1 + 32 + 1 + 14)
+        box_last_x, box_last_y = page.mouse.move.await_args_list[32].args
+        self.assertAlmostEqual(box_last_x, 450.0, places=2)
+        self.assertAlmostEqual(box_last_y, 2000.0, places=2)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["verification"]["ok"])
 
 
 class VTableResizeColumnTests(unittest.IsolatedAsyncioTestCase):

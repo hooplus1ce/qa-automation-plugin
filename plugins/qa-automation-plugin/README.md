@@ -327,7 +327,7 @@ elicitation 多字段表单在 Desktop 不受支持，会报"不支持表单"并
 - `vtable_get_cell_center`: 计算单元格中心顶层视口坐标。
 - `vtable_scroll_to`: 精确滚动 VTable 表格到指定行/列/坐标。
 - `vtable_select_rows`: 勾选/取消勾选 Canvas 表格多行复选框。
-- `vtable_drag_column`: 复刻真实鼠标拖拽移动 VTable 列位置。
+- `vtable_drag_column`: 复刻真实鼠标拖拽移动 VTable 列位置（自动处理整列选中，表头未启用整列选中时兜底框选整列）。
 - `vtable_resize_column`: 复刻真实鼠标拖拽 VTable 列头分隔线调整列宽（拖后自动校验）。
 
 ### 3. 会话导出工具 (1 个)

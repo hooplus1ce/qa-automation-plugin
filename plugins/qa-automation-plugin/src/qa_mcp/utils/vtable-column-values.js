@@ -543,6 +543,16 @@ function getHeaderDragGeometry(sourceCol, dropCol) {
   try {
     result.sourceCanDragByDefine = !!(t._canDragHeaderPosition && t._canDragHeaderPosition(sourceCol, headerRow));
   } catch (e) { result.sourceCanDragByDefine = false; }
+  // 源列 body 最后一行 (全局行号 = rowCount - 1, 与 VTable select ranges / _canDragHeaderPosition 判定一致):
+  // 供"表头未启用整列选中时纵向框选整列"兜底使用 —— 框选终点必须真实命中该行单元格。
+  // 虚拟滚动未渲染该行时 cellViewport 返回 null → center=null, visible=false (需要先滚动再重采)。
+  var lastBodyRowGlobal = (t.rowCount || 1) - 1;
+  var lastBody = cellViewport(sourceCol, lastBodyRowGlobal);
+  result.lastBodyRowGlobal = lastBodyRowGlobal;
+  result.sourceLastBodyCenter = lastBody
+    ? { x: _duRound((lastBody.x1 + lastBody.x2) / 2), y: _duRound((lastBody.y1 + lastBody.y2) / 2) }
+    : null;
+  result.sourceLastBodyVisible = !!(lastBody && lastBody.visible);
   return result;
 }
 

@@ -807,9 +807,12 @@ class VTableManager:
         通过真实鼠标拖拽 VTable 列头，把 source 列移动到 target 列的前方/后方。
 
         完全复刻人工操作 (canvas 渲染, 只能基于坐标 + 真实鼠标事件):
-          1. 点击 source 列头中部 → 整列选中 (VTable 要求整列选中才能启动列拖拽,
-             即 stateManager.select 范围必须覆盖到最后一行, 否则 _canDragHeaderPosition 拒绝)
-          2. 按下鼠标不松 → 分步移动指针到落点 → 松开 (page.mouse down/move/up)
+          1. 让源列进入整列选中状态 (VTable 要求整列选中才能启动列拖拽,
+             即 select ranges 覆盖到全局最后一行, 否则 _canDragHeaderPosition 拒绝):
+             先点击 source 列头中部 (headerSelectMode 为 single/body 等时一次点击即整列选中);
+             若表头未启用整列选中 (headerSelectMode='cell', 点击只选中表头单元格),
+             则兜底真实鼠标纵向框选: 在列头按下 → 拖到源列 body 最后一行松开 → 整列选中
+          2. 再次按下鼠标不松 → 分步移动指针到落点 → 松开 (page.mouse down/move/up)
           3. 读取拖拽后的列顺序验证结果
 
         落点语义 (由 VTable 源码 dragHeader 机制决定, 落点列 = 指针所在列):
@@ -986,15 +989,77 @@ class VTableManager:
                     return True, px, py
             return False, None, None
 
+        # ---- 4b. 兜底: 真实鼠标纵向框选整列 ----
+        # 表头未启用整列选中 (headerSelectMode='cell') 时, 点击列头只选中表头单元格,
+        # 无法满足 VTable 的拖拽启动前提 (整列选中到全局最后一行)。此时复刻人工操作:
+        # 在源列头按下 → 纵向拖到源列 body 最后一行松开 → 形成覆盖整列的选中范围,
+        # 之后再次按下列头即可正常启动列头拖拽。全程真实鼠标事件, 不使用实例 API 改状态。
+        async def _select_source_column_by_drag() -> bool:
+            last_row = geom.get("lastBodyRowGlobal")
+            last_center = geom.get("sourceLastBodyCenter")
+            if last_row is None:
+                return False, None, None
+            # 源列 body 最后一行不在视口内 (虚拟滚动未渲染 → 无几何) → 先纵向滚动到该行。
+            # 滚动仅移动视图, 不改列顺序; 表头行不随纵向滚动, 起点坐标仍有效。
+            if not geom.get("sourceLastBodyVisible", True) or not last_center:
+                try:
+                    await frame.evaluate(
+                        """(args) => {
+                            const t = window._vtable;
+                            if (!t || typeof t.scrollToRow !== 'function') return false;
+                            t.scrollToRow(args.row);
+                            return true;
+                        }""",
+                        {"row": int(last_row)},
+                    )
+                    await asyncio.sleep(0.5)
+                    geom2 = await _run_vtable_js(
+                        frame,
+                        f"getHeaderDragGeometry({int(source_col)}, {int(drop_col)})",
+                    )
+                    last_center = (geom2 or {}).get("sourceLastBodyCenter")
+                except Exception:
+                    last_center = None
+                if not last_center:
+                    return False, None, None
+            for cx, cy in click_points:
+                await page.mouse.move(cx, cy)
+                await asyncio.sleep(0.08)
+                await page.mouse.down()
+                await asyncio.sleep(0.1)
+                steps = max(8, min(32, int(abs(last_center["y"] - cy) / 50) + 1))
+                for i in range(1, steps + 1):
+                    r = i / steps
+                    eased = r * r * (3 - 2 * r)  # ease-in-out
+                    await page.mouse.move(
+                        cx + (last_center["x"] - cx) * eased,
+                        cy + (last_center["y"] - cy) * eased,
+                    )
+                    await asyncio.sleep(0.02)
+                # 终点悬停稳定 (让 VTable 渲染选中范围)
+                await asyncio.sleep(0.15)
+                await page.mouse.up()
+                await asyncio.sleep(0.45)
+                sel = await _run_vtable_js(
+                    frame, f"getColumnSelectionState({int(source_col)})"
+                )
+                if sel and sel.get("selected"):
+                    return True, cx, cy
+            return False, None, None
+
         selected, sel_x, sel_y = await _select_source_column()
         if not selected:
             # 重试一轮 (个别表格首次点击有渲染时序/需先收起浮层)
             selected, sel_x, sel_y = await _select_source_column()
         if not selected:
+            # 点击无法整列选中 (如 headerSelectMode='cell') → 真实鼠标框选整列兜底
+            selected, sel_x, sel_y = await _select_source_column_by_drag()
+        if not selected:
             raise Exception(
-                f"点击列头后未能整列选中 (headerSelectMode={geom.get('headerSelectMode')}): "
-                f"VTable 要求整列选中才能启动列头拖拽, 请确认前端 headerSelectMode 配置 "
-                f"为 'single'/'multiple'/'body' 之一; 若该列为行序号/冻结/禁用列, 也无法参与拖拽"
+                f"未能让源列 {resolved['fieldOf']} 进入整列选中状态 "
+                f"(点击列头与纵向框选均未生效, headerSelectMode={geom.get('headerSelectMode')}): "
+                f"VTable 要求整列选中才能启动列头拖拽; 若该列为行序号/冻结/禁用列, "
+                f"或表格禁用了框选 (select.disableDragSelect), 也无法参与拖拽"
             )
 
         # 选中后再确认拖拽启动条件 (列级 dragHeader 配置)
