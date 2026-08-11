@@ -2,8 +2,9 @@ import asyncio
 import json
 import logging
 import math
+import time
 from pathlib import Path
-from typing import Dict, Any, List, Union
+from typing import Callable, Dict, Any, List, Union
 from qa_mcp.tools.browser import (
     browser_mgr,
     observe_after_click,
@@ -66,6 +67,29 @@ async def _run_vtable_js(frame, call_expr: str) -> Any:
     """在目标 frame 中执行 挂载 + 调用表达式, 返回其结果。"""
     script = _SCANNER_JS + "\n" + _VALUES_JS + "\n" + call_expr
     return await frame.evaluate(script)
+
+
+async def _poll_vtable(
+    frame,
+    call_expr_fn: Callable[[], str],
+    predicate: Callable[[Any], bool],
+    timeout_ms: float = 3000,
+    interval_ms: float = 0.15,
+) -> Any:
+    """轮询 VTable JS 结果直到谓词成立或超时, 返回最后一次结果。
+
+    canvas 渲染无 DOM 信号, Playwright 无法被动等待; 用"就绪即继续"的
+    状态轮询替代固定 sleep —— 条件通常 1~2 轮即命中, 比固定延时更高效。
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    last = None
+    while True:
+        last = await _run_vtable_js(frame, call_expr_fn())
+        if predicate(last):
+            return last
+        if time.monotonic() >= deadline:
+            return last
+        await asyncio.sleep(interval_ms)
 
 class VTableManager:
     """
@@ -364,8 +388,17 @@ class VTableManager:
         if not result.get("ok"):
             raise Exception(f"滚动 VTable 失败: {result.get('reason')}")
 
-        # 等待滚动稳定
-        await asyncio.sleep(0.3)
+        # 等待滚动稳定: 目标可见则轮询可视 (就绪即继续), 否则短暂等待
+        # (canvas 无 DOM 信号, Playwright 无法被动等待, 用状态轮询替代固定 sleep)
+        if verify and col_idx is not None:
+            body_row = int(row_index) + 1 if row_index is not None else 1
+            await _poll_vtable(
+                frame,
+                lambda: f"({{ const v = isCellInViewport({int(col_idx)}, {int(body_row)}); return {{ visible: v }}; }})()",
+                lambda r: bool(r.get("visible")),
+            )
+        else:
+            await asyncio.sleep(0.15)
 
         # 读取滚动后状态
         state = await _run_vtable_js(frame, """
@@ -669,11 +702,13 @@ class VTableManager:
                 cy = iframe_rect["top"] + located["canvas_rect"]["top"] + (t["rect"]["y1"] + t["rect"]["y2"]) / 2
                 logger.info(f"[select_rows] click row={t['record_index']} attempt={attempt + 1} visible={t['visible']} coord=({cx:.1f}, {cy:.1f})")
                 await page.mouse.click(cx, cy)
-                await asyncio.sleep(0.3)
 
-                # 点击后验证: 达到预期状态则成功, 否则视为渲染竞态, 重定位重试
-                if await self._is_checked(frame, t["record_index"]) == expected:
-                    break
+                # 点击后验证: 轮询勾选状态直至预期 (canvas 无 DOM 信号, 用
+                # "就绪即继续"的状态轮询替代固定 sleep; 未达成视为渲染竞态)
+                for _ in range(20):
+                    if await self._is_checked(frame, t["record_index"]) == expected:
+                        break
+                    await asyncio.sleep(0.15)
 
             clicked.append({"record_index": t["record_index"], "body_row": t["body_row"]})
 
@@ -1020,12 +1055,14 @@ class VTableManager:
         async def _select_source_column() -> bool:
             for px, py in click_points:
                 await page.mouse.click(px, py)
-                await asyncio.sleep(0.35)
-                sel = await _run_vtable_js(
-                    frame, f"getColumnSelectionState({int(source_col)})"
-                )
-                if sel and sel.get("selected"):
-                    return True, px, py
+                # 轮询选中状态直至就绪 (替代固定 sleep)
+                for _ in range(24):
+                    sel = await _run_vtable_js(
+                        frame, f"getColumnSelectionState({int(source_col)})"
+                    )
+                    if sel and sel.get("selected"):
+                        return True, px, py
+                    await asyncio.sleep(0.1)
             return False, None, None
 
         # ---- 4b. 兜底: 真实鼠标纵向框选整列 ----
@@ -1055,15 +1092,19 @@ class VTableManager:
                         }""",
                         {"row": int(last_row)},
                     )
-                    await asyncio.sleep(0.5)
-                    geom2 = await _run_vtable_js(
-                        frame,
-                        f"getHeaderDragGeometry({int(source_col)}, {int(drop_col)})",
-                    )
-                    geom2 = _sanitize_geom(geom2 or {})
-                    last_center = (geom2 or {}).get("sourceLastBodyCenter")
-                    if not _point_ok(last_center):
+                    # 轮询滚动后重采几何, 直至源列最后一行几何有效 (替代固定 sleep)
+                    last_center = None
+                    for _ in range(20):
+                        geom2 = await _run_vtable_js(
+                            frame,
+                            f"getHeaderDragGeometry({int(source_col)}, {int(drop_col)})",
+                        )
+                        geom2 = _sanitize_geom(geom2 or {})
+                        last_center = (geom2 or {}).get("sourceLastBodyCenter")
+                        if _point_ok(last_center):
+                            break
                         last_center = None
+                        await asyncio.sleep(0.15)
                 except Exception:
                     last_center = None
                 if not last_center:
@@ -1083,12 +1124,14 @@ class VTableManager:
                 # 终点悬停稳定 (让 VTable 渲染选中范围)
                 await asyncio.sleep(0.15)
                 await page.mouse.up()
-                await asyncio.sleep(0.45)
-                sel = await _run_vtable_js(
-                    frame, f"getColumnSelectionState({int(source_col)})"
-                )
-                if sel and sel.get("selected"):
-                    return True, cx, cy
+                # 轮询选中状态直至就绪 (替代固定 sleep)
+                for _ in range(24):
+                    sel = await _run_vtable_js(
+                        frame, f"getColumnSelectionState({int(source_col)})"
+                    )
+                    if sel and sel.get("selected"):
+                        return True, cx, cy
+                    await asyncio.sleep(0.1)
             return False, None, None
 
         # ---- 4c. 兜底: 编程式整列选中 ----
