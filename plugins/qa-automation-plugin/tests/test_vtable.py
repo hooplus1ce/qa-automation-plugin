@@ -37,6 +37,17 @@ class FakePage:
         self.mouse.move = AsyncMock()
         self.mouse.down = AsyncMock()
         self.mouse.up = AsyncMock()
+        # vtable 坐标合成改用 Playwright 原生 locator.bounding_box() 读 iframe 偏移
+        _loc = MagicMock()
+        _loc.bounding_box = AsyncMock(
+            return_value={
+                "x": iframe_rect.get("left", 0.0),
+                "y": iframe_rect.get("top", 0.0),
+                "width": 800,
+                "height": 600,
+            }
+        )
+        self.locator = MagicMock(return_value=_loc)
 
     async def evaluate(self, script, arg=None):
         return self._iframe_rect
@@ -725,9 +736,11 @@ class VTableDragColumnTests(unittest.IsolatedAsyncioTestCase):
         # 按下 + 松开
         page.mouse.down.assert_awaited_once()
         page.mouse.up.assert_awaited_once()
-        # 1 次初始定位 + 14 步缓动移动, 最后一步落在落点列中心 (500..600)
-        self.assertEqual(page.mouse.move.await_count, 15)
-        last_x, last_y = page.mouse.move.await_args.args
+        # 1 次初始定位 + 1 次带 steps 的平滑移动 (Playwright 内部派发 14 个 mousemove)
+        self.assertEqual(page.mouse.move.await_count, 2)
+        last_call = page.mouse.move.await_args
+        self.assertEqual(last_call.kwargs.get("steps"), 14)
+        last_x, last_y = last_call.args
         self.assertAlmostEqual(last_x, 550.0, places=2)
         self.assertAlmostEqual(last_y, 120.0, places=2)
         # 验证结果: 源列 B 新位置在 E 的后一位
@@ -834,12 +847,16 @@ class VTableDragColumnTests(unittest.IsolatedAsyncioTestCase):
         # 框选 down/up 1 次 + 拖拽 down/up 1 次
         self.assertEqual(page.mouse.down.await_count, 2)
         self.assertEqual(page.mouse.up.await_count, 2)
-        # 框选: 初始定位 1 + 缓动 18 步 (|1000-120|/50+1≈18), 终点 = 源列 body 最后一行中心 (450,1000)
-        self.assertEqual(page.mouse.move.await_count, 1 + 18 + 1 + 14)
-        box_last_x, box_last_y = page.mouse.move.await_args_list[18].args
+        # 框选: 初始定位 1 + 1 次带 steps 的平滑移动 (Playwright 内部派发 18 个 mousemove), 终点 = (450,1000)
+        # 拖拽: 初始定位 1 + 1 次带 steps 的平滑移动
+        self.assertEqual(page.mouse.move.await_count, 4)
+        box_last_call = page.mouse.move.await_args_list[1]
+        self.assertEqual(box_last_call.kwargs.get("steps"), 18)
+        box_last_x, box_last_y = box_last_call.args
         self.assertAlmostEqual(box_last_x, 450.0, places=2)
         self.assertAlmostEqual(box_last_y, 1000.0, places=2)
-        # 拖拽落点不变
+        # 拖拽落点不变 (最后一次调用为带 steps 的平滑移动)
+        self.assertEqual(page.mouse.move.await_args.kwargs.get("steps"), 14)
         last_x, last_y = page.mouse.move.await_args.args
         self.assertAlmostEqual(last_x, 550.0, places=2)
         self.assertAlmostEqual(last_y, 120.0, places=2)
@@ -878,13 +895,137 @@ class VTableDragColumnTests(unittest.IsolatedAsyncioTestCase):
         result = await mgr.drag_column("B", "E", position="after")
 
         self.assertEqual(page.mouse.down.await_count, 2)
-        # 框选: 初始定位 1 + 缓动 32 步 (|2000-120|/50+1=38, 上限 32), 终点 = 重采后的 (450,2000)
-        self.assertEqual(page.mouse.move.await_count, 1 + 32 + 1 + 14)
-        box_last_x, box_last_y = page.mouse.move.await_args_list[32].args
+        # 框选: 初始定位 1 + 1 次带 steps 的平滑移动 (Playwright 内部派发 32 个 mousemove), 终点 = 重采后的 (450,2000)
+        # 拖拽: 初始定位 1 + 1 次带 steps 的平滑移动
+        self.assertEqual(page.mouse.move.await_count, 4)
+        box_last_call = page.mouse.move.await_args_list[1]
+        self.assertEqual(box_last_call.kwargs.get("steps"), 32)
+        box_last_x, box_last_y = box_last_call.args
         self.assertAlmostEqual(box_last_x, 450.0, places=2)
         self.assertAlmostEqual(box_last_y, 2000.0, places=2)
         self.assertEqual(result["status"], "success")
         self.assertTrue(result["verification"]["ok"])
+
+    async def test_drag_with_nan_last_center_does_not_crash_and_falls_back_to_scroll_box_select(self):
+        """回归: 源列 body 最后一行几何为 NaN (虚拟滚动哨兵值) 时, 不再抛 int(NaN) 崩溃,
+        而是净化后走 scrollToRow + 重采几何 + 框选整列 → 拖拽成功"""
+        geom = dict(
+            DRAG_GEOM,
+            headerSelectMode="cell",
+            sourceLastBodyCenter={"x": float("nan"), "y": float("nan")},
+            sourceLastBodyVisible=False,
+        )
+        geom2 = dict(
+            DRAG_GEOM,
+            headerSelectMode="cell",
+            sourceLastBodyCenter={"x": 450.0, "y": 1000.0},
+            sourceLastBodyVisible=True,
+        )
+        mgr, page = self._make_mgr([
+            RESOLVE_AFTER,
+            geom,                # NaN 最后一行几何 (未渲染哨兵值)
+            True,
+            NO_ICONS,
+            {"selected": False},
+            {"selected": False},
+            True,                # scrollToRow (滚动到源列最后一行)
+            geom2,               # 滚动后重采几何 (坐标有效)
+            {"selected": True},
+            True,
+            AFTER_GEOM_AFTER,
+        ])
+
+        result = await mgr.drag_column("B", "E", position="after")
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["verification"]["ok"])
+        # 框选 down/up 1 次 + 拖拽 down/up 1 次 (证明确实走了框选兜底)
+        self.assertEqual(page.mouse.down.await_count, 2)
+        self.assertEqual(page.mouse.up.await_count, 2)
+
+    async def test_drag_with_nan_last_center_after_scroll_returns_not_effective(self):
+        """回归: 滚动重采后几何仍为 NaN → 不再抛错, 编程式兜底也失败时继续动作链, 返回明确诊断结果"""
+        geom = dict(
+            DRAG_GEOM,
+            headerSelectMode="cell",
+            sourceLastBodyCenter={"x": float("nan"), "y": float("nan")},
+            sourceLastBodyVisible=False,
+        )
+        after_unchanged = dict(DRAG_GEOM)  # 拖拽后列顺序未变
+        mgr, page = self._make_mgr([
+            RESOLVE_AFTER,
+            geom,
+            True,
+            NO_ICONS,
+            {"selected": False},
+            {"selected": False},
+            True,                # scrollToRow
+            geom,                # 重采后仍为 NaN → 框选放弃
+            {"ok": False, "reason": "无 selectCells"},  # 编程式选中兜底 (实例无选中 API)
+            {"selected": False}, # 编程式后仍未选中
+            True,                # _canDragHeaderPosition 拖拽启动条件
+            after_unchanged,     # 拖拽后列顺序未变 → 返回 not_effective
+        ])
+
+        result = await mgr.drag_column("B", "E", position="after")
+
+        # 不再抛异常: 返回明确诊断结果, 而非中断/崩溃
+        self.assertEqual(result["status"], "not_effective")
+        self.assertFalse(result["verification"]["ok"])
+        self.assertIn("headerSelectMode", result["reason"])
+
+    async def test_drag_programmatic_select_when_header_select_none(self):
+        """headerSelectMode=None 且框选禁用: 点击/框选均失败 → 编程式整列选中兜底 → 拖拽成功"""
+        geom = dict(DRAG_GEOM, headerSelectMode=None)
+        mgr, page = self._make_mgr([
+            RESOLVE_AFTER,
+            geom,
+            True,
+            NO_ICONS,
+            {"selected": False},  # 第一次点击后未选中
+            {"selected": False},  # 第二次点击后未选中
+            {"selected": False},  # 框选后仍未选中 (框选被禁用)
+            {"ok": True, "method": "selectCells"},  # 编程式选中兜底 JS
+            {"selected": True},   # 编程式选中后整列选中
+            True,                 # _canDragHeaderPosition 拖拽启动条件
+            AFTER_GEOM_AFTER,     # 拖拽后列顺序
+        ])
+
+        result = await mgr.drag_column("B", "E", position="after")
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["verification"]["ok"])
+        self.assertEqual(result["selection"]["header_select_mode"], None)
+        # 无真实框选 (编程式选中), 按压点回退到源列头中心 (450,120)
+        first_x, first_y = page.mouse.move.await_args_list[0].args
+        self.assertAlmostEqual(first_x, 450.0, places=2)
+        self.assertAlmostEqual(first_y, 120.0, places=2)
+
+    async def test_drag_with_nan_source_header_geometry_raises_clear_error(self):
+        """回归: 源列表头矩形坐标为 NaN (未渲染) → 明确报错, 而不是 int(NaN) 崩溃"""
+        geom = dict(
+            DRAG_GEOM,
+            sourceHeader={"x1": float("nan"), "x2": 500.0, "y1": 100.0, "y2": 140.0, "visible": True, "source": "scenegraph"},
+        )
+        mgr, page = self._make_mgr([RESOLVE_AFTER, geom, True])
+
+        with self.assertRaisesRegex(Exception, "无法获取源列表头矩形"):
+            await mgr.drag_column("B", "E", position="after")
+
+        page.mouse.down.assert_not_awaited()
+
+    async def test_drag_with_nan_drop_header_geometry_raises_clear_error(self):
+        """回归: 落点列矩形坐标为 NaN → 明确报错, 而不是 int(NaN) 崩溃"""
+        geom = dict(
+            DRAG_GEOM,
+            dropHeader={"x1": 500.0, "x2": float("nan"), "y1": 100.0, "y2": 140.0, "visible": True, "source": "scenegraph"},
+        )
+        mgr, page = self._make_mgr([RESOLVE_AFTER, geom, True])
+
+        with self.assertRaisesRegex(Exception, "无法获取落点列"):
+            await mgr.drag_column("B", "E", position="after")
+
+        page.mouse.down.assert_not_awaited()
 
 
 class VTableResizeColumnTests(unittest.IsolatedAsyncioTestCase):
@@ -907,8 +1048,9 @@ class VTableResizeColumnTests(unittest.IsolatedAsyncioTestCase):
 
         result = await mgr.resize_column("乙", 160)
 
-        # 1 次初始悬停定位 + 18 步缓动; 最后一步落在 (x1 + 目标宽度) = 400 + 160
-        self.assertEqual(page.mouse.move.await_count, 19)
+        # 1 次初始悬停定位 + 1 次带 steps 的平滑移动 (Playwright 内部派发 18 个 mousemove)
+        self.assertEqual(page.mouse.move.await_count, 2)
+        self.assertEqual(page.mouse.move.await_args.kwargs.get("steps"), 18)
         first_x, first_y = page.mouse.move.await_args_list[0].args
         self.assertAlmostEqual(first_x, 500.0, places=2)  # 分隔线 = 列头右边界 x2
         self.assertAlmostEqual(first_y, 120.0, places=2)  # 表头行中线
@@ -946,6 +1088,18 @@ class VTableResizeColumnTests(unittest.IsolatedAsyncioTestCase):
             await mgr.resize_column("乙", 160)
 
         page.mouse.down.assert_not_awaited()
+
+    async def test_raises_clear_error_when_header_geometry_nan(self):
+        """回归: 列头矩形坐标为 NaN (虚拟滚动哨兵值) → 明确报错, 而不是 int(NaN)/坐标 NaN 崩溃"""
+        geom = dict(RESIZE_GEOM)
+        geom["header"] = dict(RESIZE_GEOM["header"], x1=float("nan"), width=float("nan"))
+        mgr, page = self._make_mgr([geom])
+
+        with self.assertRaisesRegex(Exception, "无法获取列头矩形"):
+            await mgr.resize_column("乙", 160)
+
+        page.mouse.down.assert_not_awaited()
+        page.mouse.move.assert_not_awaited()
 
     async def test_raises_when_width_below_min_column_width(self):
         """目标宽度小于配置的 minColumnWidth 时拒绝拖拽"""

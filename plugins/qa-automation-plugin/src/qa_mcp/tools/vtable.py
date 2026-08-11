@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Dict, Any, List, Union
 from qa_mcp.tools.browser import (
@@ -20,6 +21,46 @@ logger = logging.getLogger("mcp_automation.vtable")
 _JS_DIR = Path(__file__).resolve().parent.parent / "utils"
 _SCANNER_JS = (_JS_DIR / "vtable-scanner.js").read_text(encoding="utf-8")
 _VALUES_JS = (_JS_DIR / "vtable-column-values.js").read_text(encoding="utf-8")
+
+# ---- 几何数据防御 (虚拟滚动哨兵值) ----
+# VTable 对未渲染的虚拟滚动单元格, scenegraph 会返回 ±Number.MAX_VALUE 哨兵 bounds,
+# 经 frame.evaluate 序列化后 Python 侧可能拿到 float('inf') / float('nan')。
+# 统一在拿到几何结果后净化: 非有限浮点 → None, 避免后续 int()/坐标求和直接崩溃。
+def _finite_num(v, default=None) -> Union[float, None]:
+    """若 v 为有限数字返回 float(v), 否则返回 default (None 表示缺失/无效)。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _sanitize_geom(geom):
+    """把几何结果中的非有限浮点 (NaN/Infinity) 递归归一化为 None。"""
+    if isinstance(geom, dict):
+        return {k: _sanitize_geom(v) for k, v in geom.items()}
+    if isinstance(geom, list):
+        return [_sanitize_geom(v) for v in geom]
+    if isinstance(geom, float) and not math.isfinite(geom):
+        return None
+    return geom
+
+
+def _rect_coords_ok(rect) -> bool:
+    """列头/落点矩形四角坐标均需为有限数字, 否则视为无效几何。"""
+    if not isinstance(rect, dict):
+        return False
+    return all(_finite_num(rect.get(k)) is not None for k in ("x1", "x2", "y1", "y2"))
+
+
+def _point_ok(center) -> bool:
+    """点坐标 (x/y) 需为有限数字。"""
+    return bool(
+        isinstance(center, dict)
+        and _finite_num(center.get("x")) is not None
+        and _finite_num(center.get("y")) is not None
+    )
+
 
 async def _run_vtable_js(frame, call_expr: str) -> Any:
     """在目标 frame 中执行 挂载 + 调用表达式, 返回其结果。"""
@@ -562,15 +603,11 @@ class VTableManager:
         if located.get("error"):
             raise Exception(located["error"])
 
-        # 顶层文档上下文：计算 iframe 相较于顶层视口的偏移
-        iframe_rect = await page.evaluate("""(sel) => {
-            const el = document.querySelector(sel);
-            if (!el) return null;
-            const r = el.getBoundingClientRect();
-            return { left: r.left, top: r.top };
-        }""", iframe_selector)
-        if not iframe_rect:
+        # 顶层文档上下文：计算 iframe 相较于顶层视口的偏移 (Playwright 原生, 免手写 JS)
+        iframe_box = await page.locator(iframe_selector).bounding_box()
+        if not iframe_box:
             raise Exception(f"未找到匹配的 iframe: {iframe_selector}")
+        iframe_rect = {"left": iframe_box["x"], "top": iframe_box["y"]}
 
         # 根据 action 决定每行是否需要点击（check/uncheck 幂等，toggle 全点）
         checked_keys = set(await self._get_checked_keys(frame))
@@ -750,17 +787,13 @@ class VTableManager:
         if located.get("error"):
             raise Exception(located["error"])
 
-        # 顶层文档上下文: 计算 iframe 相较于顶层视口的偏移
+        # 顶层文档上下文: 计算 iframe 相较于顶层视口的偏移 (Playwright 原生, 免手写 JS)
         # (iframe_selector="" 表示 VTable 直接渲染在主文档, 偏移为 0)
         if iframe_selector:
-            iframe_rect = await page.evaluate("""(sel) => {
-                const el = document.querySelector(sel);
-                if (!el) return null;
-                const r = el.getBoundingClientRect();
-                return { left: r.left, top: r.top };
-            }""", iframe_selector)
-            if not iframe_rect:
+            iframe_box = await page.locator(iframe_selector).bounding_box()
+            if not iframe_box:
                 raise Exception(f"未找到匹配的 iframe: {iframe_selector}")
+            iframe_rect = {"left": iframe_box["x"], "top": iframe_box["y"]}
         else:
             iframe_rect = {"left": 0.0, "top": 0.0}
 
@@ -884,6 +917,7 @@ class VTableManager:
         geom = await _run_vtable_js(frame, f"getHeaderDragGeometry({int(source_col)}, {int(drop_col)})")
         if geom.get("error"):
             raise Exception(f"采集列头几何信息失败: {geom['error']}")
+        geom = _sanitize_geom(geom)
 
         drag_mode = geom.get("dragHeaderMode")
         if drag_mode not in ("all", "column"):
@@ -911,9 +945,12 @@ class VTableManager:
 
         src_h = geom.get("sourceHeader")
         drop_h = geom.get("dropHeader")
-        if not src_h:
-            raise Exception("无法获取源列表头矩形")
-        if not drop_h:
+        if not src_h or not _rect_coords_ok(src_h):
+            raise Exception(
+                "无法获取源列表头矩形 (该列可能未渲染或坐标无效): "
+                "请先横向滚动使源列可见后重试"
+            )
+        if not drop_h or not _rect_coords_ok(drop_h):
             raise Exception(
                 f"无法获取落点列 (col={drop_col}) 表头矩形: 该列可能未渲染 (虚拟滚动), "
                 f"请先横向滚动使源列与目标列同时可见后重试"
@@ -945,9 +982,11 @@ class VTableManager:
         # ---- 4. 真实交互: 点击列头中部选中整列 (VTable 拖拽启动前提) ----
         # 列头单元格内可能渲染交互图标 (排序/筛选/冻结/下拉等), pointerdown 命中
         # 图标时 VTable 会消费事件、跳过选中与拖拽启动, 因此点击点需避开图标。
+        header_row_num = _finite_num(geom.get("headerRow"), 0)
+        header_row_num = int(header_row_num)
         icon_info = await _run_vtable_js(
             frame,
-            f"getCellIconsViewport({int(source_col)}, {int(geom['headerRow'])}, '', 'basic')",
+            f"getCellIconsViewport({int(source_col)}, {header_row_num}, '', 'basic')",
         )
         blockers = []
         for ic in (icon_info or {}).get("icons", []) or []:
@@ -997,8 +1036,12 @@ class VTableManager:
         async def _select_source_column_by_drag() -> bool:
             last_row = geom.get("lastBodyRowGlobal")
             last_center = geom.get("sourceLastBodyCenter")
-            if last_row is None:
+            if _finite_num(last_row) is None:
                 return False, None, None
+            last_row = int(_finite_num(last_row))
+            # 几何无效 (哨兵值 → 净化后 None, 或坐标非有限) 视为"该行未渲染", 需先滚动再重采
+            if not _point_ok(last_center):
+                last_center = None
             # 源列 body 最后一行不在视口内 (虚拟滚动未渲染 → 无几何) → 先纵向滚动到该行。
             # 滚动仅移动视图, 不改列顺序; 表头行不随纵向滚动, 起点坐标仍有效。
             if not geom.get("sourceLastBodyVisible", True) or not last_center:
@@ -1017,7 +1060,10 @@ class VTableManager:
                         frame,
                         f"getHeaderDragGeometry({int(source_col)}, {int(drop_col)})",
                     )
+                    geom2 = _sanitize_geom(geom2 or {})
                     last_center = (geom2 or {}).get("sourceLastBodyCenter")
+                    if not _point_ok(last_center):
+                        last_center = None
                 except Exception:
                     last_center = None
                 if not last_center:
@@ -1027,15 +1073,13 @@ class VTableManager:
                 await asyncio.sleep(0.08)
                 await page.mouse.down()
                 await asyncio.sleep(0.1)
-                steps = max(8, min(32, int(abs(last_center["y"] - cy) / 50) + 1))
-                for i in range(1, steps + 1):
-                    r = i / steps
-                    eased = r * r * (3 - 2 * r)  # ease-in-out
-                    await page.mouse.move(
-                        cx + (last_center["x"] - cx) * eased,
-                        cy + (last_center["y"] - cy) * eased,
-                    )
-                    await asyncio.sleep(0.02)
+                # 坐标已在上方校验为有限数字, 这里再兜底一次, 防止异常数据触发 int(NaN) 崩溃
+                tx = _finite_num(last_center.get("x"), 0.0)
+                ty = _finite_num(last_center.get("y"), 0.0)
+                # 一次 move + steps: 与主拖拽一致, 由 Playwright 内部连续派发 mousemove,
+                # 不依赖 ease-in-out 轨迹; 步数与纵向距离成正比 (上限 32)
+                steps = max(8, min(32, int(abs(ty - cy) / 50) + 1))
+                await page.mouse.move(tx, ty, steps=steps)
                 # 终点悬停稳定 (让 VTable 渲染选中范围)
                 await asyncio.sleep(0.15)
                 await page.mouse.up()
@@ -1047,6 +1091,41 @@ class VTableManager:
                     return True, cx, cy
             return False, None, None
 
+        # ---- 4c. 兜底: 编程式整列选中 ----
+        # headerSelectMode=None 且表格禁用鼠标框选 (select.disableDragSelect) 时, 点击与
+        # 真实框选都无法让源列整列进入选中状态 (VTable 拖拽启动前提: ranges 覆盖全局最后一行)。
+        # 此兜底通过 VTable 公开 API selectCells / selectRanges (或写 stateManager.select.ranges)
+        # 将源列整列设为选中范围 —— 仅设置选中状态, 不修改任何列位置, 列顺序变更仍由真实
+        # 鼠标拖拽触发。即使该兜底也失败, 也不中断执行: 继续完整动作链, 是否生效交给最终验证。
+        async def _select_source_column_programmatic() -> bool:
+            try:
+                prog = await frame.evaluate(
+                    """(args) => {
+                        const t = window._vtable;
+                        const sm = t && t.stateManager;
+                        if (!sm) return { ok: false, reason: '无 stateManager' };
+                        const lastRow = (t.rowCount || 1) - 1;
+                        const range = { start: { col: args.col, row: 0 }, end: { col: args.col, row: lastRow } };
+                        let method = '';
+                        if (typeof t.selectCells === 'function') { t.selectCells({ range, add: false }); method = 'selectCells'; }
+                        else if (typeof t.selectRanges === 'function') { t.selectRanges([range]); method = 'selectRanges'; }
+                        else if (sm.select) { sm.select.ranges = [range]; method = 'stateManager'; }
+                        else return { ok: false, reason: '无 selectCells/selectRanges/stateManager.select' };
+                        return { ok: true, method };
+                    }""",
+                    {"col": int(source_col)},
+                )
+                await asyncio.sleep(0.3)
+                sel = await _run_vtable_js(
+                    frame, f"getColumnSelectionState({int(source_col)})"
+                )
+                if sel and sel.get("selected"):
+                    return True
+                return False
+            except Exception as e:
+                logger.warning(f"[drag_column] 编程式整列选中失败: {e}")
+                return False
+
         selected, sel_x, sel_y = await _select_source_column()
         if not selected:
             # 重试一轮 (个别表格首次点击有渲染时序/需先收起浮层)
@@ -1055,12 +1134,16 @@ class VTableManager:
             # 点击无法整列选中 (如 headerSelectMode='cell') → 真实鼠标框选整列兜底
             selected, sel_x, sel_y = await _select_source_column_by_drag()
         if not selected:
-            raise Exception(
-                f"未能让源列 {resolved['fieldOf']} 进入整列选中状态 "
-                f"(点击列头与纵向框选均未生效, headerSelectMode={geom.get('headerSelectMode')}): "
-                f"VTable 要求整列选中才能启动列头拖拽; 若该列为行序号/冻结/禁用列, "
-                f"或表格禁用了框选 (select.disableDragSelect), 也无法参与拖拽"
-            )
+            # 框选也未生效 (headerSelectMode=None / 框选禁用) → 编程式整列选中兜底;
+            # 不中断执行, 若兜底也失败则记录警告后继续完整拖拽动作链
+            if await _select_source_column_programmatic():
+                selected, sel_x, sel_y = True, None, None
+            else:
+                logger.warning(
+                    f"[drag_column] 源列 {resolved['fieldOf']} 未能进入整列选中状态 "
+                    f"(headerSelectMode={geom.get('headerSelectMode')}), 继续执行拖拽动作链, "
+                    f"是否生效由最终验证判定"
+                )
 
         # 选中后再确认拖拽启动条件 (列级 dragHeader 配置)
         can_drag = await frame.evaluate(
@@ -1069,34 +1152,32 @@ class VTableManager:
                 try { return !!(t._canDragHeaderPosition && t._canDragHeaderPosition(args.col, args.row)); }
                 catch (e) { return false; }
             }""",
-            {"col": source_col, "row": geom["headerRow"]},
+            {"col": source_col, "row": header_row_num},
         )
         if not can_drag:
-            raise Exception(
-                f"源列 {resolved['fieldOf']} 不满足拖拽启动条件 "
+            # 不中断: 拖拽启动条件未满足时仍执行完整动作链, 是否生效交给最终验证
+            logger.warning(
+                f"[drag_column] 源列 {resolved['fieldOf']} 未满足拖拽启动条件 "
                 f"(dragHeaderMode={drag_mode}, headerSelectMode={geom.get('headerSelectMode')}, "
-                f"frozenColDragHeaderMode={frozen_mode}, 列级 dragHeader 可能为 false)"
+                f"frozenColDragHeaderMode={frozen_mode}), 继续执行拖拽动作链"
             )
 
         # ---- 5. 分步真实拖拽 (按下 → 缓动移动 → 松开) ----
+        press_x = sel_x if sel_x is not None else src_cx
+        press_y = sel_y if sel_y is not None else src_cy
         logger.info(
             f"[drag_column] src=col{source_col}({resolved['fieldOf']}) "
             f"target=col{target_col}({resolved['targetField']}) position={pos} "
-            f"drop=col{drop_col} coord=({drop_cx:.1f}, {drop_cy:.1f}) press=({sel_x:.1f}, {sel_y:.1f})"
+            f"drop=col{drop_col} coord=({drop_cx:.1f}, {drop_cy:.1f}) press=({press_x:.1f}, {press_y:.1f})"
         )
-        await page.mouse.move(sel_x, sel_y)
+        await page.mouse.move(press_x, press_y)
         await asyncio.sleep(0.08)
         await page.mouse.down()
         await asyncio.sleep(0.1)
-        steps = 14
-        for i in range(1, steps + 1):
-            t_ratio = i / steps
-            eased = t_ratio * t_ratio * (3 - 2 * t_ratio)  # ease-in-out
-            await page.mouse.move(
-                sel_x + (drop_cx - sel_x) * eased,
-                sel_y + (drop_cy - sel_y) * eased,
-            )
-            await asyncio.sleep(0.045)
+        # 一次 move + steps: 由 Playwright 内部连续派发 mousemove (无逐步 await/sleep),
+        # 事件节奏交给浏览器按帧 coalesce —— 比"逐步 await + sleep(0.045)" (约 20fps) 更平滑,
+        # 接近真实鼠标拖拽。VTable 拖拽只关心按下状态与落点, 不依赖 ease-in-out 轨迹, 线性插值即可。
+        await page.mouse.move(drop_cx, drop_cy, steps=14)
         # 落点悬停稳定 (让 VTable 渲染拖拽指示线并更新目标列)
         await asyncio.sleep(0.15)
         await page.mouse.up()
@@ -1107,6 +1188,7 @@ class VTableManager:
             frame,
             f"getHeaderDragGeometry({int(source_col)}, {int(drop_col)})",
         )
+        after_geom = _sanitize_geom(after_geom or {})
         after = after_geom.get("fields")
         if not isinstance(after, list):
             raise Exception(f"拖拽后读取列顺序失败: {after_geom}")
@@ -1126,15 +1208,33 @@ class VTableManager:
             ok = moved and src_new == tgt_new + 1
 
         if not ok:
-            raise Exception(
-                f"列拖拽未生效或结果不符: 期望 {resolved['titleOf']} "
-                f"在 {resolved['targetTitle']} 的{('前方' if pos == 'before' else '后方')} "
-                f"(新位置 src={src_new}, target={tgt_new}, moved={moved}). "
-                f"诊断: dragHeaderMode={drag_mode}, headerSelectMode={geom.get('headerSelectMode')}, "
-                f"frozenColDragHeaderMode={frozen_mode}. "
-                f"可能原因: 目标与源列跨分组/层级 (VTable 默认禁止跨父级移动), "
-                f"或前端 validateDragOrderOnEnd 拒绝了本次移动。"
-            )
+            # 不中断: 动作链已完整执行, 返回明确诊断结果而非抛异常
+            return {
+                "status": "not_effective",
+                "reason": (
+                    f"列拖拽动作链已执行但列顺序未变化: 期望 {resolved['titleOf']} "
+                    f"在 {resolved['targetTitle']} 的{('前方' if pos == 'before' else '后方')} "
+                    f"(新位置 src={src_new}, target={tgt_new}, moved={moved}). "
+                    f"诊断: dragHeaderMode={drag_mode}, headerSelectMode={geom.get('headerSelectMode')}, "
+                    f"frozenColDragHeaderMode={frozen_mode}. "
+                    f"可能原因: 目标与源列跨分组/层级 (VTable 默认禁止跨父级移动), "
+                    f"整列选中未达成 (选中机制被禁用), 或前端 validateDragOrderOnEnd 拒绝了本次移动。"
+                ),
+                "source": {"col": source_col, "field": src_field, "title": resolved["titleOf"]},
+                "target": {"col": target_col, "field": tgt_field, "title": resolved["targetTitle"]},
+                "position": pos,
+                "selection": {"selected_full_column": selected, "header_select_mode": geom.get("headerSelectMode")},
+                "drag_options": {
+                    "dragHeaderMode": drag_mode,
+                    "frozenColDragHeaderMode": frozen_mode,
+                },
+                "verification": {
+                    "ok": False,
+                    "source_index_before": src_old,
+                    "source_index_after": src_new,
+                    "target_index_after": tgt_new,
+                },
+            }
 
         return {
             "status": "success",
@@ -1200,10 +1300,14 @@ class VTableManager:
         geom = await _run_vtable_js(frame, f"getHeaderResizeGeometry({json.dumps(col)})")
         if geom.get("error"):
             raise Exception(geom["error"])
+        geom = _sanitize_geom(geom)
 
         h = geom.get("header")
-        if not h:
-            raise Exception("无法获取列头矩形")
+        if not h or not _rect_coords_ok(h):
+            raise Exception(
+                "无法获取列头矩形 (该列可能未渲染或坐标无效): "
+                "请先横向滚动使该列可见后重试"
+            )
         if not h.get("visible"):
             raise Exception(
                 f"列头当前不可见 (横向视口外): col={geom['col']}({geom['field']}), "
@@ -1223,10 +1327,10 @@ class VTableManager:
         if isinstance(max_w, (int, float)) and target_width > max_w:
             raise Exception(f"目标宽度 {target_width}px 大于配置的最大列宽 {max_w}px")
 
-        cur_width = h["width"]
-        start_x = h["x2"]  # 分隔线 = 列头右边界
-        start_y = (h["y1"] + h["y2"]) / 2
-        target_x = h["x1"] + target_width
+        cur_width = _finite_num(h.get("width"), 0.0)
+        start_x = _finite_num(h.get("x2"), 0.0)  # 分隔线 = 列头右边界
+        start_y = (_finite_num(h.get("y1"), 0.0) + _finite_num(h.get("y2"), 0.0)) / 2
+        target_x = _finite_num(h.get("x1"), 0.0) + target_width
         delta = target_x - start_x
 
         # ---- 2. 真实交互: 悬停分隔线 → 按下 → 分步缓动拖动 → 松开 ----
@@ -1239,12 +1343,9 @@ class VTableManager:
         await asyncio.sleep(0.12)  # 悬停稳定, 让 VTable 进入 resize 判定区
         await page.mouse.down()
         await asyncio.sleep(0.12)
-        steps = 18
-        for i in range(1, steps + 1):
-            t_ratio = i / steps
-            eased = t_ratio * t_ratio * (3 - 2 * t_ratio)  # ease-in-out
-            await page.mouse.move(start_x + delta * eased, start_y)
-            await asyncio.sleep(0.04)
+        # 一次 move + steps: 与 vtable_drag_column 一致, 由 Playwright 内部连续派发
+        # mousemove, 不依赖 ease-in-out 轨迹, 平滑度接近真实鼠标拖拽
+        await page.mouse.move(target_x, start_y, steps=18)
         await asyncio.sleep(0.15)  # 落点悬停稳定 (VTable 渲染拖拽反馈)
         await page.mouse.up()
         await asyncio.sleep(0.5)

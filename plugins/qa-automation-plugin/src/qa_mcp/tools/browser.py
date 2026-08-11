@@ -8,7 +8,14 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from fastmcp import Context
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from playwright.async_api import (
+    async_playwright,
+    Page,
+    Browser,
+    BrowserContext,
+    TimeoutError as PlaywrightTimeoutError,
+    expect,
+)
 from qa_mcp.config import (
     CDP_URL,
     EVIDENCE_DIR,
@@ -185,7 +192,37 @@ class BrowserManager:
         async with self._lock:
             await self._close_unlocked()
 
+    async def recover(self, label: str = "动作") -> None:
+        """CDP 挂死/半开时强制重建连接 (供动作看门狗调用)。
+
+        Playwright 动作级 timeout 在协议调用无限挂起时可能不生效 (CDP 半开),
+        此处尽力安全关闭旧连接并重新建立; 重建失败仅记录日志、不抛错,
+        原始错误信息由调用方 (看门狗) 携带。
+        """
+        logger.warning(f"[{label}] 检测到 CDP 挂死, 尝试重建浏览器连接...")
+        async with self._lock:
+            try:
+                await asyncio.wait_for(self._close_unlocked(), timeout=10)
+            except (asyncio.TimeoutError, Exception):
+                # 旧连接彻底卡死无法关闭: 直接丢弃引用, 下次 get_page 重新拉起
+                self._playwright = None
+                self._browser = None
+                self._context = None
+                self._target_page = None
+            try:
+                self._playwright = await asyncio.wait_for(
+                    async_playwright().start(), timeout=10
+                )
+                await asyncio.wait_for(self._connect(), timeout=15)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.error(f"[{label}] 重建浏览器连接失败: {e}")
+
 browser_mgr = BrowserManager()
+
+
+async def _recover_after_hang(label: str) -> None:
+    """CDP 挂死看门狗兜底: 尽力重建浏览器连接 (见 BrowserManager.recover)。"""
+    await browser_mgr.recover(label)
 
 async def get_frame_path(frame) -> List[str]:
     path = []
@@ -1763,7 +1800,7 @@ async def wait_for_condition_impl(
     timeout_ms: int = 15000,
     poll_interval_ms: int = 300,
 ) -> dict:
-    """等待页面条件成立 (轮询), 超时返回最后一次状态快照, 不抛错。
+    """等待页面条件成立 (Playwright 原生轮询等待), 超时返回最后一次状态快照, 不抛错。
 
     condition:
       element_visible:  selector 可见 (默认);
@@ -1771,6 +1808,11 @@ async def wait_for_condition_impl(
       element_has_text: selector 的可见文本包含 expected_text (exact=True 时精确相等);
       text_present:     目标 iframe (或全部 frame) 页面文本出现 expected_text;
       url_contains:     页面 URL 包含 expected_text。
+
+    底层由 Playwright 的 locator.wait_for / expect / wait_for_url / expect.poll 原生
+    等待引擎驱动 (自带智能轮询与 actionability), 不再手写 while+sleep 轮询;
+    超时 (TimeoutError/AssertionError) 时用 _check_wait_condition 读取最后一次
+    状态快照返回, 保持 MCP 工具"不抛错、可复核"的契约。
 
     selector/expected_text 必填要求随 condition 而异; timeout_ms 上限 60s。
     典型用法: 提交表单后 wait_for_condition(condition="text_present",
@@ -1787,34 +1829,85 @@ async def wait_for_condition_impl(
 
     page = await browser_mgr.get_page()
     started = time.monotonic()
-    last_state: Dict[str, Any] = {}
 
-    while True:
+    async def _snapshot() -> Dict[str, Any]:
         try:
-            last_state = await _check_wait_condition(
+            return await _check_wait_condition(
                 page, condition, selector, iframe_selector, expected_text, exact
             )
         except Exception as e:
-            last_state = {"met": False, "error": str(e)}
-        if last_state.get("met"):
-            return {
-                "status": "success",
-                "condition": condition,
-                "met": True,
-                "elapsed_ms": int((time.monotonic() - started) * 1000),
-                "state": last_state.get("detail"),
-            }
-        elapsed = time.monotonic() - started
-        if elapsed >= timeout_ms / 1000:
-            return {
-                "status": "timeout",
-                "condition": condition,
-                "met": False,
-                "elapsed_ms": int(elapsed * 1000),
-                "state": last_state.get("detail"),
-                "note": "超时未满足, 返回最后一次检查状态; 可用 probe_dynamic_layers / analyze_current_page 复核",
-            }
-        await asyncio.sleep(poll_interval_ms / 1000)
+            return {"met": False, "error": str(e)}
+
+    async def _poll_text_present() -> bool:
+        # text_present 用 textContent 而非 innerText: innerText 只返回"渲染可见"文本,
+        # 对 display:none / 动画中 (ant-message move-up-leave 类) 的元素读不到,
+        # 短命校验消息 (3s) 极易错过; textContent 返回全部 DOM 文本 (含隐藏态),
+        # 语义为"文本已挂载即出现", 且无 reflow 开销 (大页面快一个量级)。
+        frames: List[Any] = []
+        if iframe_selector:
+            target, _ = await _resolve_frame_target(page, iframe_selector)
+            frame = await _locator_content_frame(target)
+            if frame is not None:
+                frames = [frame]
+        else:
+            # 主 frame 优先: 消息/校验提示通常在顶层或最近交互 frame,
+            # 避免每次轮询从第一个 frame 开始扫而拖慢命中
+            frames = [page.main_frame] + [f for f in page.frames if f != page.main_frame]
+        for f in frames:
+            try:
+                body_text = await f.evaluate(
+                    "() => document.body ? (document.body.textContent || '') : ''"
+                )
+            except Exception:
+                continue
+            if body_text and expected_text in body_text:
+                return True
+        return False
+
+    try:
+        if condition == "url_contains":
+            # wait_for_url 原生智能轮询; 用谓词避免 glob 特殊字符转义问题
+            await page.wait_for_url(
+                lambda u: expected_text in u, timeout=timeout_ms
+            )
+        elif condition == "text_present":
+            await expect.poll(
+                _poll_text_present, timeout=timeout_ms, intervals=[poll_interval_ms]
+            ).to_be_truthy()
+        else:
+            target, _ = await _resolve_frame_target(page, iframe_selector)
+            lc = target.locator(selector).first
+            if condition == "element_visible":
+                await lc.wait_for(state="visible", timeout=timeout_ms)
+            elif condition == "element_hidden":
+                # hidden 语义含"不存在" (Playwright 原生), 与原 count==0 判断一致
+                await lc.wait_for(state="hidden", timeout=timeout_ms)
+            else:  # element_has_text
+                if exact:
+                    await expect(lc).to_have_text(
+                        expected_text, use_inner_text=True, timeout=timeout_ms
+                    )
+                else:
+                    await expect(lc).to_contain_text(
+                        expected_text, use_inner_text=True, timeout=timeout_ms
+                    )
+        return {
+            "status": "success",
+            "condition": condition,
+            "met": True,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "state": (await _snapshot()).get("detail"),
+        }
+    except (PlaywrightTimeoutError, AssertionError):
+        last_state = await _snapshot()
+        return {
+            "status": "timeout",
+            "condition": condition,
+            "met": False,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "state": last_state.get("detail"),
+            "note": "超时未满足, 返回最后一次检查状态; 可用 probe_dynamic_layers / analyze_current_page 复核",
+        }
 
 
 async def _check_wait_condition(
@@ -1936,6 +2029,7 @@ async def download_file_impl(
     cdp = await page.context.browser.new_browser_cdp_session()
     begin_info: Dict[str, Dict[str, Any]] = {}
     state_map: Dict[str, str] = {}
+    done = asyncio.Event()  # 下载进度事件驱动 (替代 0.1s 固定轮询)
 
     def _on_will_begin(payload: Dict[str, Any]) -> None:
         guid = str(payload.get("guid", ""))
@@ -1950,6 +2044,7 @@ async def download_file_impl(
         state = payload.get("state")
         if guid:
             state_map[guid] = state
+        done.set()  # 任一进度事件到达即唤醒等待
 
     cdp.on("Browser.downloadWillBegin", _on_will_begin)
     cdp.on("Browser.downloadProgress", _on_progress)
@@ -1965,13 +2060,22 @@ async def download_file_impl(
             role=role, name=name,
             description=description or "触发下载",
         )
-        while True:
-            finished = begin_info and all(
-                state_map.get(g) in ("completed", "canceled") for g in begin_info
-            )
-            if finished or time.monotonic() - started >= timeout / 1000:
-                break
-            await asyncio.sleep(0.1)
+        async def _await_downloads() -> None:
+            # 事件驱动: 下载进度事件到达即重查终态; 0.2s 保险轮询兜底 (防事件丢失)
+            while not (
+                begin_info
+                and all(state_map.get(g) in ("completed", "canceled") for g in begin_info)
+            ):
+                done.clear()
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    continue
+
+        try:
+            await asyncio.wait_for(_await_downloads(), timeout=timeout / 1000)
+        except asyncio.TimeoutError:
+            pass  # 超时交给下方 finished 判断统一收尾
     finally:
         # 恢复浏览器默认下载行为 (不干扰用户日常下载); 失败仅告警。
         try:

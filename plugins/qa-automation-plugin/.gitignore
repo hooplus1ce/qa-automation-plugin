@@ -145,3 +145,9 @@ chrome-debug-profile/
 
 # 本地调试脚本 (含硬编码 API Key, 不提交)
 test.py
+
+# 现场诊断脚本 (一次性, 不入库)
+debug_*.py
+
+# 运行时证据资产 (截图/录制/导出, 不入库)
+evidence_assets/

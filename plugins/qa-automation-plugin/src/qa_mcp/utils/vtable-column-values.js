@@ -113,10 +113,11 @@ function getCellCenterViewport(col, row) {
   if (!vtEl) return null;
   var vtRect = vtEl.getBoundingClientRect();
   var cx = null, cy = null;
-  // 优先用 scenegraph 的 globalAABBBounds
+  // 优先用 scenegraph 的 globalAABBBounds (需为有效坐标, 未渲染单元格的哨兵值会被守卫拦截)
   try {
     var cell = t.scenegraph && t.scenegraph.getCell ? t.scenegraph.getCell(col, row) : null;
-    if (cell && cell.globalAABBBounds) {
+    if (cell && cell.globalAABBBounds
+        && _duUsableViewport(cell.globalAABBBounds.x1, cell.globalAABBBounds.x2, cell.globalAABBBounds.y1, cell.globalAABBBounds.y2)) {
       var b = cell.globalAABBBounds;
       cx = (b.x1 + b.x2) / 2; cy = (b.y1 + b.y2) / 2;
     }
@@ -127,7 +128,9 @@ function getCellCenterViewport(col, row) {
       var rect = t.getCellRect ? t.getCellRect(col, row) : null;
       if (rect) {
         var r0 = rect.bounds || rect;
-        cx = (r0.x1 + r0.x2) / 2; cy = (r0.y1 + r0.y2) / 2;
+        if (_duUsableViewport(r0.x1, r0.x2, r0.y1, r0.y2)) {
+          cx = (r0.x1 + r0.x2) / 2; cy = (r0.y1 + r0.y2) / 2;
+        }
       }
     } catch (e) {}
   }
@@ -142,6 +145,19 @@ function _duRound(n) {
   return Math.round(n * 10) / 10;
 }
 
+// ---- 几何有效性守卫 (虚拟滚动哨兵值) ----
+// VTable 对未渲染的虚拟滚动单元格, scenegraph 的 globalAABBBounds 可能返回
+// ±Number.MAX_VALUE 哨兵坐标: typeof 是 number 且 Number.isFinite 也是 true,
+// 仅用 typeof 判断会放行, 后续 round/求和会产生 Infinity/NaN/巨大坐标, 拖拽直接崩溃。
+// 统一用「有限 + 量级 (< 1e7 px)」双重校验把这类"未渲染"单元格挡在门外。
+function _duFiniteCoord(v) {
+  return typeof v === 'number' && Number.isFinite(v) && Math.abs(v) < 1e7;
+}
+function _duUsableViewport(vx1, vx2, vy1, vy2) {
+  return _duFiniteCoord(vx1) && _duFiniteCoord(vx2)
+      && _duFiniteCoord(vy1) && _duFiniteCoord(vy2);
+}
+
 function _duSafeValue(value) {
   if (value === undefined || value === null) return null;
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
@@ -150,7 +166,7 @@ function _duSafeValue(value) {
 
 function _duBounds(node) {
   var b = node && node.globalAABBBounds;
-  if (!b || typeof b.x1 !== 'number') return null;
+  if (!b || !_duUsableViewport(b.x1, b.x2, b.y1, b.y2)) return null;
   var w = b.x2 - b.x1, h = b.y2 - b.y1;
   return {
     x1: _duRound(b.x1), y1: _duRound(b.y1),
@@ -461,21 +477,26 @@ function getHeaderDragGeometry(sourceCol, dropCol) {
   var scrollLeft = t.scrollLeft || 0;
   var scrollTop = t.scrollTop || 0;
 
-  // 单元格在【顶层视口】的矩形 (场景图优先, getCellRect 兜底)
+  // 单元格在【顶层视口】的矩形 (场景图优先, getCellRect 兜底)。
+  // 虚拟滚动未渲染的行/列, scenegraph 返回 ±MAX 哨兵 bounds → _duUsableViewport 拦截返回 null,
+  // 调用方据此判断"未渲染/不可用"并给出明确指引, 而不是把 Infinity/NaN 传给 Python 侧。
   function cellViewport(col, row) {
+    function wrap(vx1, vx2, vy1, vy2, source) {
+      return {
+        x1: _duRound(vx1), x2: _duRound(vx2), y1: _duRound(vy1), y2: _duRound(vy2),
+        visible: vx1 >= ifrRect.left + cr.left - 0.5 && vx2 <= ifrRect.left + cr.left + canvasViewportWidth + 0.5,
+        source: source
+      };
+    }
     try {
       var cell = t.scenegraph && t.scenegraph.getCell ? t.scenegraph.getCell(col, row) : null;
-      if (cell && cell.globalAABBBounds && typeof cell.globalAABBBounds.x1 === 'number') {
+      if (cell && cell.globalAABBBounds) {
         var b = cell.globalAABBBounds;
         var vx1 = ifrRect.left + vtRect.left + b.x1;
         var vx2 = ifrRect.left + vtRect.left + b.x2;
         var vy1 = ifrRect.top + vtRect.top + b.y1;
         var vy2 = ifrRect.top + vtRect.top + b.y2;
-        return {
-          x1: _duRound(vx1), x2: _duRound(vx2), y1: _duRound(vy1), y2: _duRound(vy2),
-          visible: vx1 >= ifrRect.left + cr.left - 0.5 && vx2 <= ifrRect.left + cr.left + canvasViewportWidth + 0.5,
-          source: 'scenegraph'
-        };
+        if (_duUsableViewport(vx1, vx2, vy1, vy2)) return wrap(vx1, vx2, vy1, vy2, 'scenegraph');
       }
     } catch (e) {}
     try {
@@ -486,11 +507,7 @@ function getHeaderDragGeometry(sourceCol, dropCol) {
         var vx2 = ifrRect.left + cr.left + r.x2 - scrollLeft;
         var vy1 = ifrRect.top + cr.top + r.y1 - scrollTop;
         var vy2 = ifrRect.top + cr.top + r.y2 - scrollTop;
-        return {
-          x1: _duRound(vx1), x2: _duRound(vx2), y1: _duRound(vy1), y2: _duRound(vy2),
-          visible: vx1 >= ifrRect.left + cr.left - 0.5 && vx2 <= ifrRect.left + cr.left + canvasViewportWidth + 0.5,
-          source: 'cellRect'
-        };
+        if (_duUsableViewport(vx1, vx2, vy1, vy2)) return wrap(vx1, vx2, vy1, vy2, 'cellRect');
       }
     } catch (e) {}
     return null;
@@ -601,30 +618,28 @@ function getHeaderResizeGeometry(col) {
   function cellViewport(c, row) {
     try {
       var cell = t.scenegraph && t.scenegraph.getCell ? t.scenegraph.getCell(c, row) : null;
-      if (cell && cell.globalAABBBounds && typeof cell.globalAABBBounds.x1 === 'number') {
+      if (cell && cell.globalAABBBounds) {
         var b = cell.globalAABBBounds;
-        return {
-          x1: ifrRect.left + vtRect.left + b.x1,
-          x2: ifrRect.left + vtRect.left + b.x2,
-          y1: ifrRect.top + vtRect.top + b.y1,
-          y2: ifrRect.top + vtRect.top + b.y2,
-          width: b.x2 - b.x1,
-          source: 'scenegraph'
-        };
+        var vx1 = ifrRect.left + vtRect.left + b.x1;
+        var vx2 = ifrRect.left + vtRect.left + b.x2;
+        var vy1 = ifrRect.top + vtRect.top + b.y1;
+        var vy2 = ifrRect.top + vtRect.top + b.y2;
+        if (_duUsableViewport(vx1, vx2, vy1, vy2)) {
+          return { x1: vx1, x2: vx2, y1: vy1, y2: vy2, width: b.x2 - b.x1, source: 'scenegraph' };
+        }
       }
     } catch (e) {}
     try {
       var rect = t.getCellRect ? t.getCellRect(c, row) : null;
       if (rect) {
         var r = rect.bounds || rect;
-        return {
-          x1: ifrRect.left + cr.left + r.x1 - (t.scrollLeft || 0),
-          x2: ifrRect.left + cr.left + r.x2 - (t.scrollLeft || 0),
-          y1: ifrRect.top + cr.top + r.y1 - (t.scrollTop || 0),
-          y2: ifrRect.top + cr.top + r.y2 - (t.scrollTop || 0),
-          width: r.x2 - r.x1,
-          source: 'cellRect'
-        };
+        var vx1 = ifrRect.left + cr.left + r.x1 - (t.scrollLeft || 0);
+        var vx2 = ifrRect.left + cr.left + r.x2 - (t.scrollLeft || 0);
+        var vy1 = ifrRect.top + cr.top + r.y1 - (t.scrollTop || 0);
+        var vy2 = ifrRect.top + cr.top + r.y2 - (t.scrollTop || 0);
+        if (_duUsableViewport(vx1, vx2, vy1, vy2)) {
+          return { x1: vx1, x2: vx2, y1: vy1, y2: vy2, width: r.x2 - r.x1, source: 'cellRect' };
+        }
       }
     } catch (e) {}
     return null;
