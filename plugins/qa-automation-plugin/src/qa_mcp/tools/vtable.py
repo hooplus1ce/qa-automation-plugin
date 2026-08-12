@@ -678,21 +678,26 @@ class VTableManager:
                         }
                         return true;
                     }""", {"bodyRow": t["body_row"], "colIndex": located["col_index"]})
-                    await asyncio.sleep(0.5)
-                    current = await frame.evaluate("""(args) => {
-                        const vtable = window._vtable;
-                        const rect = vtable.getCellRect(args.colIndex, args.bodyRow);
-                        const cr = vtable.container.querySelector('canvas').getBoundingClientRect();
-                        const scrollTop = vtable.scrollTop || 0;
-                        const scrollLeft = vtable.scrollLeft || 0;
-                        const vy1 = rect.bounds.y1 - scrollTop;
-                        const vy2 = rect.bounds.y2 - scrollTop;
-                        return {
-                            rect: { x1: rect.bounds.x1 - scrollLeft, y1: vy1, x2: rect.bounds.x2 - scrollLeft, y2: vy2 },
-                            canvas_rect: { left: cr.left, top: cr.top },
-                            visible: vy1 >= 0 && vy2 <= cr.height
-                        };
-                    }""", {"bodyRow": t["body_row"], "colIndex": located["col_index"]})
+                    # 轮询滚动后该行进入可视区 (canvas 无 DOM 信号, 状态轮询替代固定 sleep)
+                    current = None
+                    for _ in range(20):
+                        current = await frame.evaluate("""(args) => {
+                            const vtable = window._vtable;
+                            const rect = vtable.getCellRect(args.colIndex, args.bodyRow);
+                            const cr = vtable.container.querySelector('canvas').getBoundingClientRect();
+                            const scrollTop = vtable.scrollTop || 0;
+                            const scrollLeft = vtable.scrollLeft || 0;
+                            const vy1 = rect.bounds.y1 - scrollTop;
+                            const vy2 = rect.bounds.y2 - scrollTop;
+                            return {
+                                rect: { x1: rect.bounds.x1 - scrollLeft, y1: vy1, x2: rect.bounds.x2 - scrollLeft, y2: vy2 },
+                                canvas_rect: { left: cr.left, top: cr.top },
+                                visible: vy1 >= 0 && vy2 <= cr.height
+                            };
+                        }""", {"bodyRow": t["body_row"], "colIndex": located["col_index"]})
+                        if current.get("visible"):
+                            break
+                        await asyncio.sleep(0.1)
                     t["rect"] = current["rect"]
                     located["canvas_rect"] = current["canvas_rect"]
                     t["visible"] = current["visible"]
@@ -705,10 +710,14 @@ class VTableManager:
 
                 # 点击后验证: 轮询勾选状态直至预期 (canvas 无 DOM 信号, 用
                 # "就绪即继续"的状态轮询替代固定 sleep; 未达成视为渲染竞态)
+                checked_ok = False
                 for _ in range(20):
                     if await self._is_checked(frame, t["record_index"]) == expected:
+                        checked_ok = True
                         break
                     await asyncio.sleep(0.15)
+                if checked_ok:
+                    break
 
             clicked.append({"record_index": t["record_index"], "body_row": t["body_row"]})
 
@@ -1060,7 +1069,7 @@ class VTableManager:
                     sel = await _run_vtable_js(
                         frame, f"getColumnSelectionState({int(source_col)})"
                     )
-                    if sel and sel.get("selected"):
+                    if isinstance(sel, dict) and sel.get("selected"):
                         return True, px, py
                     await asyncio.sleep(0.1)
             return False, None, None
@@ -1129,7 +1138,7 @@ class VTableManager:
                     sel = await _run_vtable_js(
                         frame, f"getColumnSelectionState({int(source_col)})"
                     )
-                    if sel and sel.get("selected"):
+                    if isinstance(sel, dict) and sel.get("selected"):
                         return True, cx, cy
                     await asyncio.sleep(0.1)
             return False, None, None
@@ -1158,12 +1167,14 @@ class VTableManager:
                     }""",
                     {"col": int(source_col)},
                 )
-                await asyncio.sleep(0.3)
-                sel = await _run_vtable_js(
-                    frame, f"getColumnSelectionState({int(source_col)})"
-                )
-                if sel and sel.get("selected"):
-                    return True
+                # 轮询选中状态直至就绪 (替代固定 sleep)
+                for _ in range(20):
+                    sel = await _run_vtable_js(
+                        frame, f"getColumnSelectionState({int(source_col)})"
+                    )
+                    if isinstance(sel, dict) and sel.get("selected"):
+                        return True
+                    await asyncio.sleep(0.1)
                 return False
             except Exception as e:
                 logger.warning(f"[drag_column] 编程式整列选中失败: {e}")
@@ -1224,14 +1235,22 @@ class VTableManager:
         # 落点悬停稳定 (让 VTable 渲染拖拽指示线并更新目标列)
         await asyncio.sleep(0.15)
         await page.mouse.up()
-        await asyncio.sleep(0.5)
+        # 轮询拖拽结果: 列顺序已变则立即继续 (canvas 无 DOM 信号, 状态轮询替代固定 sleep)
+        after_geom = None
+        for _ in range(10):
+            after_geom = await _run_vtable_js(
+                frame,
+                f"getHeaderDragGeometry({int(source_col)}, {int(drop_col)})",
+            )
+            after_geom = _sanitize_geom(after_geom or {})
+            if (
+                isinstance(after_geom.get("fields"), list)
+                and after_geom["fields"] != geom.get("fields", [])
+            ):
+                break
+            await asyncio.sleep(0.05)
 
         # ---- 6. 读取拖拽后的列顺序并验证 ----
-        after_geom = await _run_vtable_js(
-            frame,
-            f"getHeaderDragGeometry({int(source_col)}, {int(drop_col)})",
-        )
-        after_geom = _sanitize_geom(after_geom or {})
         after = after_geom.get("fields")
         if not isinstance(after, list):
             raise Exception(f"拖拽后读取列顺序失败: {after_geom}")
@@ -1391,10 +1410,16 @@ class VTableManager:
         await page.mouse.move(target_x, start_y, steps=18)
         await asyncio.sleep(0.15)  # 落点悬停稳定 (VTable 渲染拖拽反馈)
         await page.mouse.up()
-        await asyncio.sleep(0.5)
+        # 轮询列宽直至接近目标 (canvas 无 DOM 信号, 状态轮询替代固定 sleep)
+        after = None
+        for _ in range(10):
+            after = await _run_vtable_js(frame, f"getColumnWidth({json.dumps(geom['col'])})")
+            w = (after or {}).get("width") if isinstance(after, dict) else None
+            if w is not None and abs(w - target_width) <= 2:
+                break
+            await asyncio.sleep(0.05)
 
         # ---- 3. 重读列宽验证 ----
-        after = await _run_vtable_js(frame, f"getColumnWidth({json.dumps(geom['col'])})")
         after_w = (after or {}).get("width") if isinstance(after, dict) else None
         if after_w is None:
             raise Exception(f"拖拽后读取列宽失败: {after}")

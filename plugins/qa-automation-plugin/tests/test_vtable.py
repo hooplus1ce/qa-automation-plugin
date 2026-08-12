@@ -833,11 +833,11 @@ class VTableDragColumnTests(unittest.IsolatedAsyncioTestCase):
             geom,                # 2. 几何信息 (headerSelectMode='cell')
             True,                # 3. 列级 dragHeader 校验
             NO_ICONS,            # 4. 源列表头图标 (无图标 → 点击点=列头中心)
-            {"selected": False},  # 5. 点击列头后未整列选中 (cell 模式只选表头单元格)
-            {"selected": False},  # 6. 重试一轮仍失败
-            {"selected": True},   # 7. 框选(按下→拖到最后一行→松开)后整列选中
-            True,                # 8. 拖拽启动条件
-            AFTER_GEOM_AFTER,    # 9. 拖拽后列顺序
+            # 5-52. 点击列头选中已改为轮询: 两次点击各 24 轮轮询均未选中 (cell 模式只选表头单元格)
+            *([{"selected": False}] * 48),
+            {"selected": True},   # 53. 框选(按下→拖到最后一行→松开)后整列选中
+            True,                # 54. 拖拽启动条件
+            AFTER_GEOM_AFTER,    # 55. 拖拽后列顺序
         ])
 
         result = await mgr.drag_column("B", "E", position="after")
@@ -883,8 +883,7 @@ class VTableDragColumnTests(unittest.IsolatedAsyncioTestCase):
             geom,
             True,
             NO_ICONS,
-            {"selected": False},
-            {"selected": False},
+            *([{"selected": False}] * 48),  # 两次点击各 24 轮轮询未选中
             True,                # scrollToRow (滚动到最后一行, 仅视图滚动)
             geom2,               # 滚动后重采几何 (最后一行已渲染)
             {"selected": True},
@@ -926,8 +925,7 @@ class VTableDragColumnTests(unittest.IsolatedAsyncioTestCase):
             geom,                # NaN 最后一行几何 (未渲染哨兵值)
             True,
             NO_ICONS,
-            {"selected": False},
-            {"selected": False},
+            *([{"selected": False}] * 48),  # 两次点击各 24 轮轮询未选中
             True,                # scrollToRow (滚动到源列最后一行)
             geom2,               # 滚动后重采几何 (坐标有效)
             {"selected": True},
