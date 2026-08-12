@@ -92,6 +92,27 @@ class TestCredentials(unittest.TestCase):
 
 
 class TestSseParsing(unittest.TestCase):
+    def test_resolve_endpoints_modes(self):
+        """端点解析: 默认/auto 走 failover 端点列表, sandbox/production/自定义 URL 单选。"""
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(va._resolve_endpoints("auto"), list(va.ANTIGRAVITY_ENDPOINTS))
+            self.assertEqual(va._resolve_endpoints(""), list(va.ANTIGRAVITY_ENDPOINTS))
+            self.assertEqual(va._resolve_endpoints("sandbox"), [va.SANDBOX_ENDPOINT])
+            self.assertEqual(va._resolve_endpoints("production"), [va.DAILY_ENDPOINT])
+
+    def test_resolve_endpoints_custom_url(self):
+        with patch.dict(
+            os.environ, {"ANTIGRAVITY_ENDPOINT": "https://my-cca.example.com"}, clear=True
+        ):
+            self.assertEqual(va._resolve_endpoints("auto"), ["https://my-cca.example.com"])
+
+    def test_resolve_endpoints_ignores_non_url_env(self):
+        """回归: .mcp.json 误设 ANTIGRAVITY_ENDPOINT=auto 时, 不能把裸值当请求 URL。"""
+        with patch.dict(os.environ, {"ANTIGRAVITY_ENDPOINT": "auto"}, clear=True), patch.object(
+            va, "logger"
+        ):
+            self.assertEqual(va._resolve_endpoints("auto"), list(va.ANTIGRAVITY_ENDPOINTS))
+
     def test_parse_sse_line(self):
         self.assertIsNone(va._parse_sse_line(""))
         self.assertIsNone(va._parse_sse_line("event: message"))

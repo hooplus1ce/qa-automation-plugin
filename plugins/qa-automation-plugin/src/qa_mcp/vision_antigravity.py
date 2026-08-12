@@ -389,7 +389,12 @@ def _resolve_endpoints(mode: str) -> List[str]:
         return [DAILY_ENDPOINT]
     custom = os.getenv("ANTIGRAVITY_ENDPOINT", "").strip()
     if custom:
-        return [custom]
+        if not custom.startswith(("http://", "https://")):
+            # 非 URL 的配置值 (如误设成 "auto") 视为默认, 避免把裸值当端点发请求
+            logger.warning(f"忽略无效 ANTIGRAVITY_ENDPOINT={custom!r}, 回退默认端点")
+            custom = ""
+        else:
+            return [custom]
     return list(ANTIGRAVITY_ENDPOINTS)
 
 
