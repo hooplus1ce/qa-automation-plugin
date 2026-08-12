@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import List, Optional
 from pydantic import BaseModel, Field
@@ -99,7 +100,13 @@ async def execute_and_record_impl(
 
     locator = target_context.locator(element_css)
     await locator.wait_for(state="visible", timeout=ELEMENT_WAIT_TIMEOUT_MS)
-    await locator.scroll_into_view_if_needed()
+    # 滚动降级: 持续动画页面 (VTable 重绘/antd 动效) 会使 stable 等待超时
+    # (Playwright 默认 30s), 此时元素往往已在视口内, 点击/输入内部自带滚动,
+    # 无需硬等稳定 —— 与 click_interact 的 _do_click 滚动降级保持一致。
+    try:
+        await asyncio.wait_for(locator.scroll_into_view_if_needed(), timeout=5)
+    except (asyncio.TimeoutError, Exception):
+        pass
     
     # 动态语义分析 JS 提纯算法
     semantic_info = await locator.evaluate("""el => {
@@ -178,11 +185,13 @@ async def execute_and_record_impl(
     # 执行物理操作与高亮闪烁
     await locator.evaluate("el => { el.style.outline = '3px solid #EF4444'; el.style.transition = 'outline 0.1s'; }")
     
-    # 路由动作执行
+    # 路由动作执行 (显式 timeout: 官方 actionability 智能等待, 持续动画页面
+    # 的 stable 等待可能较长, 显式限时避免默认 30s 卡死录制会话)
+    _action_timeout = max(ELEMENT_WAIT_TIMEOUT_MS, 5000)
     if action.lower() == "click":
-        await locator.click()
+        await locator.click(timeout=_action_timeout)
     elif action.lower() == "fill":
-        await locator.fill(value or "")
+        await locator.fill(value or "", timeout=_action_timeout)
     elif action.lower() == "select_option":
         await adapter.select_option(target_context, locator, value or "")
     elif action.lower() == "fill_date":

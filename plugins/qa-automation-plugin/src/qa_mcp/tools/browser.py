@@ -1809,8 +1809,9 @@ async def wait_for_condition_impl(
       text_present:     目标 iframe (或全部 frame) 页面文本出现 expected_text;
       url_contains:     页面 URL 包含 expected_text。
 
-    底层由 Playwright 的 locator.wait_for / expect / wait_for_url / expect.poll 原生
-    等待引擎驱动 (自带智能轮询与 actionability), 不再手写 while+sleep 轮询;
+    底层由 Playwright 的 locator.wait_for / expect / wait_for_url 原生等待引擎
+    驱动 (自带智能轮询与 actionability), text_present 用与 _poll_vtable 一致的手写
+    轮询 (兼容任意 Playwright 版本, 不依赖 expect.poll);
     超时 (TimeoutError/AssertionError) 时用 _check_wait_condition 读取最后一次
     状态快照返回, 保持 MCP 工具"不抛错、可复核"的契约。
 
@@ -1871,9 +1872,22 @@ async def wait_for_condition_impl(
                 lambda u: expected_text in u, timeout=timeout_ms
             )
         elif condition == "text_present":
-            await expect.poll(
-                _poll_text_present, timeout=timeout_ms, intervals=[poll_interval_ms]
-            ).to_be_truthy()
+            # 手写轮询替代 expect.poll: expect.poll 需 Playwright>=1.45,
+            # 运行环境版本不一时会报 'Expect' object has no attribute 'poll'。
+            # 与 _poll_vtable 同模式 (就绪即继续), 任意 Playwright 版本可用。
+            deadline = time.monotonic() + timeout_ms / 1000
+            met = False
+            while True:
+                if await _poll_text_present():
+                    met = True
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(poll_interval_ms / 1000)
+            if not met:
+                raise PlaywrightTimeoutError(
+                    f"text_present 超时: {timeout_ms}ms 内页面文本未出现 {expected_text!r}"
+                )
         else:
             target, _ = await _resolve_frame_target(page, iframe_selector)
             lc = target.locator(selector).first
@@ -2222,7 +2236,12 @@ async def upload_file_impl(
             full_selector = f"xpath={selector}" if by_lower == "xpath" else selector
             lc = target.locator(full_selector)
         await lc.wait_for(state="visible", timeout=ELEMENT_WAIT_TIMEOUT_MS)
-        await lc.scroll_into_view_if_needed()
+        # 滚动降级: 持续动画页面 stable 等待会默认 30s 超时, 元素往往已在视口内,
+        # click 内部自带滚动 (与 _do_click 一致), 无需硬等稳定。
+        try:
+            await asyncio.wait_for(lc.scroll_into_view_if_needed(), timeout=5)
+        except (asyncio.TimeoutError, Exception):
+            pass
         is_file_input = await lc.evaluate(
             "el => el.tagName === 'INPUT' && el.type === 'file'"
         )
@@ -2230,7 +2249,7 @@ async def upload_file_impl(
             await lc.set_input_files(paths)
             return {"mode": "set_input_files", "is_multiple": None}
         async with page.expect_file_chooser(timeout=ELEMENT_WAIT_TIMEOUT_MS) as fc_info:
-            await lc.click()
+            await lc.click(timeout=max(ELEMENT_WAIT_TIMEOUT_MS, 5000))
         chooser = await fc_info.value
         multiple = chooser.is_multiple()
         await chooser.set_files(paths)

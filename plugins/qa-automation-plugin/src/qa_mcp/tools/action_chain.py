@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from fastmcp import Context
@@ -139,7 +140,12 @@ async def _do_select_option(
             await locator.wait_for(state="visible", timeout=ELEMENT_WAIT_TIMEOUT_MS)
         except Exception as e:
             raise await _enhance_locator_timeout(e, locator, action_label) from e
-        await locator.scroll_into_view_if_needed()
+        # 滚动降级: 持续动画页面 stable 等待会默认 30s 超时, 元素往往已在视口内,
+        # 适配器内部点击自带滚动 (与 _do_click 一致), 无需硬等稳定。
+        try:
+            await asyncio.wait_for(locator.scroll_into_view_if_needed(), timeout=5)
+        except (asyncio.TimeoutError, Exception):
+            pass
         # 适配器内部: 点击触发框 → 等待 portal 下拉层 → 按选项文本点击
         await adapter.select_option(target, locator, value)
         return frame_path_list
